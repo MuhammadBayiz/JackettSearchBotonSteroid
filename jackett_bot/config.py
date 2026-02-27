@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass
 
@@ -12,13 +13,26 @@ class BotConfig:
     jackett_api_key: str
     jackett_url: str
     default_max_results: int
+    redact_after_seconds: int
+    log_file_path: str
+    console_log_level: int
+    file_log_level: int
     authorized_chat_ids: list[int]
     owner_id: int
-    auth_db_path: str
 
     @classmethod
     def from_env(cls, env_file: str = "config.env") -> "BotConfig":
         load_dotenv(env_file)
+        _validate_required_env(
+            [
+                "TELEGRAM_TOKEN",
+                "API_ID",
+                "API_HASH",
+                "JACKETT_API_KEY",
+                "JACKETT_URL",
+                "OWNER_ID",
+            ]
+        )
 
         return cls(
             token=_require_env("TELEGRAM_TOKEN"),
@@ -27,9 +41,22 @@ class BotConfig:
             jackett_api_key=_require_env("JACKETT_API_KEY"),
             jackett_url=_require_env("JACKETT_URL"),
             default_max_results=_parse_int_env("MAX_RESULTS", default=10),
+            redact_after_seconds=_parse_positive_int_env("REDACT_AFTER_SECONDS", default=300),
+            log_file_path=_parse_str_env("LOG_FILE_PATH", default="logs/jackett_bot.log"),
+            console_log_level=_parse_log_level_env("CONSOLE_LOG_LEVEL", default="INFO"),
+            file_log_level=_parse_log_level_env("FILE_LOG_LEVEL", default="DEBUG"),
             authorized_chat_ids=_parse_authorized_chat_ids(os.getenv("AUTHORIZED_CHAT_IDS", "")),
-            owner_id=_parse_int_env("OWNER_ID", default=0),
-            auth_db_path=_parse_str_env("AUTH_DB_PATH", default="auth.db"),
+            owner_id=_parse_int_env("OWNER_ID", required=True),
+        )
+
+
+def _validate_required_env(keys: list[str]):
+    missing_keys = [key for key in keys if os.getenv(key) is None or not os.getenv(key, "").strip()]
+    if missing_keys:
+        missing_list = ", ".join(missing_keys)
+        raise ValueError(
+            "Missing required config values: "
+            f"{missing_list}. Fill them in config.env before starting the bot."
         )
 
 
@@ -56,11 +83,29 @@ def _parse_int_env(key: str, default: int | None = None, required: bool = False)
         raise ValueError(f"Environment variable {key} must be an integer, got: {raw!r}") from exc
 
 
+def _parse_positive_int_env(key: str, default: int) -> int:
+    value = _parse_int_env(key, default=default)
+    if value < 1:
+        raise ValueError(f"Environment variable {key} must be >= 1, got: {value}")
+    return value
+
+
 def _parse_str_env(key: str, default: str) -> str:
-    raw = os.getenv(key)
-    if raw is None or not raw.strip():
+    value = os.getenv(key)
+    if value is None or not value.strip():
         return default
-    return raw.strip()
+    return value.strip()
+
+
+def _parse_log_level_env(key: str, default: str) -> int:
+    raw_level = os.getenv(key, default).strip().upper()
+    level = getattr(logging, raw_level, None)
+    if not isinstance(level, int):
+        raise ValueError(
+            f"Invalid log level for {key}: {raw_level!r}. "
+            "Use DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+        )
+    return level
 
 
 def _parse_authorized_chat_ids(raw_chat_ids: str) -> list[int]:
