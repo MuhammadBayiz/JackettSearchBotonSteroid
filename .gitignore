@@ -36,6 +36,11 @@ config.env
 
 # Pyrogram session files
 *.session
+*.session-journal
+
+# Runtime logs
+logs/
+*.log
 
 # Local runtime database
 auth.db

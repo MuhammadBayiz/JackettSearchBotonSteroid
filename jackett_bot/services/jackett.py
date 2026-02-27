@@ -4,8 +4,9 @@ import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import quote
 
-import requests
+import httpx
 
 
 @dataclass(frozen=True)
@@ -26,9 +27,16 @@ class SearchResult:
 
 
 class JackettService:
-    def __init__(self, jackett_url: str, jackett_api_key: str):
+    def __init__(
+        self,
+        jackett_url: str,
+        jackett_api_key: str,
+        client: httpx.AsyncClient | None = None,
+    ):
         self.jackett_url = jackett_url.rstrip("/")
         self.jackett_api_key = jackett_api_key
+        self._client = client or httpx.AsyncClient()
+        self._owns_client = client is None
 
     def build_search_url(self, query: str) -> str:
         if query.startswith("tt") and query[2:].isdigit():
@@ -37,20 +45,24 @@ class JackettService:
                 f"?apikey={self.jackett_api_key}&imdbid={query}"
             )
 
-        encoded_query = requests.utils.quote(query)
+        encoded_query = quote(query)
         return (
             f"{self.jackett_url}/api/v2.0/indexers/all/results/torznab/api"
             f"?apikey={self.jackett_api_key}&t=search&q={encoded_query}"
         )
 
-    def search(self, query: str, golden_popcorn: bool = False, timeout: int = 15) -> list[SearchResult]:
-        response = requests.get(self.build_search_url(query), timeout=timeout)
+    async def search(self, query: str, golden_popcorn: bool = False, timeout: int = 15) -> list[SearchResult]:
+        response = await self._client.get(self.build_search_url(query), timeout=timeout)
         response.raise_for_status()
 
         if not response.text.strip():
             return []
 
         return parse_search_results(response.content, golden_popcorn=golden_popcorn)
+
+    async def close(self):
+        if self._owns_client:
+            await self._client.aclose()
 
 
 def convert_size(size_bytes: int) -> str:

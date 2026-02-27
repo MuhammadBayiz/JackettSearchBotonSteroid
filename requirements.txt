@@ -1,5 +1,4 @@
 pyrogram
 python-dotenv
-requests
-telegraph
-tgcrypto
+httpx
+tgcrypto; python_version < "3.13"

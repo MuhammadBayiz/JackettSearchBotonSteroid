@@ -1,17 +1,18 @@
+import asyncio
+import html
 import logging
 import time
 import uuid
 from dataclasses import dataclass
 
-import requests
+import httpx
 from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ..config import BotConfig
 from ..services.auth import AuthorizationService
 from ..services.jackett import JackettService, SearchResult
-from ..services.ptp import check_ptp
-from ..services.telegraph import TelegraphService
+from ..services.ptp import PTPService
 
 
 @dataclass
@@ -22,7 +23,6 @@ class ReleasePaginationSession:
     query: str
     golden_popcorn: bool
     results: list[SearchResult]
-    telegraph_url: str | None
     created_at: float
 
 
@@ -32,37 +32,58 @@ class CommandHandlers:
         config: BotConfig,
         auth_service: AuthorizationService,
         jackett_service: JackettService,
-        telegraph_service: TelegraphService,
+        ptp_service: PTPService,
         logger: logging.Logger,
     ):
         self.config = config
         self.auth_service = auth_service
         self.jackett_service = jackett_service
-        self.telegraph_service = telegraph_service
+        self.ptp_service = ptp_service
         self.logger = logger
         self._pagination_sessions: dict[str, ReleasePaginationSession] = {}
         self._pagination_ttl_seconds = 3600
+        self._redaction_delay_seconds = self.config.redact_after_seconds
+        self._redaction_tasks: set[asyncio.Task] = set()
 
     async def start(self, message: Message):
         user_id = message.from_user.id if message.from_user else 0
         chat_id = message.chat.id
 
         if self._is_authorized(user_id, chat_id):
-            await message.reply_text("Bot Started")
+            await self._reply_key_value(message, "STATUS", "BOT STARTED")
         else:
-            await message.reply_text("Not Authorized")
+            await self._reply_key_value(message, "ERROR", "NOT AUTHORIZED")
+
+    async def help(self, message: Message):
+        help_text = (
+            "<b><u>BOT COMMANDS:</u></b>\n\n"
+            "<code>/help</code> - Show this command list.\n"
+            "<code>/start</code> - Verify bot access.\n"
+            "<code>/release &lt;query&gt;</code> - Search releases with pagination.\n"
+            "<code>/release &lt;query&gt; -gp</code> - Search only Golden Popcorn releases.\n"
+            "<code>/r &lt;query&gt;</code> - Short alias for /release.\n"
+            "<code>/check</code> - Check PTP availability (auth required).\n"
+            "<code>/auth [id]</code> - Owner-only temporary authorize.\n"
+            "<code>/unauth [id]</code> - Owner-only remove temporary authorization.\n"
+            "<code>/unauthall</code> - Owner-only clear temporary authorizations.\n\n"
+            "<b><u>ALIASES</u></b>\n"
+            "<code>/relase</code> - Alias for /release.\n"
+            "<code>/deauth</code> - Alias for /unauth.\n"
+            "<code>/deauthall</code> - Alias for /unauthall."
+        )
+        await message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
     async def release(self, message: Message):
         user_id = message.from_user.id if message.from_user else 0
         chat_id = message.chat.id
 
         if not self._is_authorized(user_id, chat_id):
-            await message.reply_text("Not Authorized")
+            await self._reply_key_value(message, "ERROR", "NOT AUTHORIZED")
             return
 
         command_parts = message.text.split()[1:] if message.text else []
         if not command_parts:
-            await message.reply_text("Please Provide Query or IMDb ID/URL")
+            await self._reply_key_value(message, "ERROR", "PROVIDE QUERY OR IMDB ID/URL")
             return
 
         golden_popcorn = "-gp" in command_parts
@@ -70,22 +91,21 @@ class CommandHandlers:
         query = " ".join(query_parts)
 
         if not query:
-            await message.reply_text("Please Provide Query or IMDb ID/URL")
+            await self._reply_key_value(message, "ERROR", "PROVIDE QUERY OR IMDB ID/URL")
             return
 
-        sent_message = await message.reply_text("Please Wait, Searching...")
+        sent_message = await message.reply_text(
+            self._format_key_value("STATUS", "SEARCHING..."),
+            parse_mode=ParseMode.HTML,
+        )
 
         try:
-            all_results = self.jackett_service.search(query, golden_popcorn=golden_popcorn)
+            all_results = await self.jackett_service.search(query, golden_popcorn=golden_popcorn)
 
             if not all_results:
                 no_results_suffix = " (with GP)" if golden_popcorn else ""
-                await message.reply_text(f"No Results{no_results_suffix}")
+                await self._reply_key_value(message, "RESULT", f"NO RESULTS{no_results_suffix}".upper())
                 return
-
-            telegraph_url = self.telegraph_service.send_results_to_telegraph(
-                [result.as_text() for result in all_results]
-            )
 
             session = self._create_pagination_session(
                 requester_user_id=user_id,
@@ -93,49 +113,52 @@ class CommandHandlers:
                 query=query,
                 golden_popcorn=golden_popcorn,
                 results=all_results,
-                telegraph_url=telegraph_url,
             )
 
             message_text, reply_markup = self._build_page_response(session, page=1)
-            await message.reply_text(
+            result_message = await message.reply_text(
                 message_text,
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
             )
-        except requests.exceptions.HTTPError as http_err:
+            self._schedule_message_redaction(session.session_id, result_message)
+        except httpx.HTTPStatusError as http_err:
             self.logger.error("HTTP error occurred: %s", http_err)
-            await message.reply_text("HTTP Error Occurred")
+            await self._reply_key_value(message, "ERROR", "HTTP ERROR OCCURRED")
+        except httpx.HTTPError as http_err:
+            self.logger.error("Network error occurred: %s", http_err)
+            await self._reply_key_value(message, "ERROR", "NETWORK ERROR OCCURRED")
         except Exception as exc:
             self.logger.exception("Unexpected error occurred: %s", exc)
-            await message.reply_text("Unexpected Error Occurred")
+            await self._reply_key_value(message, "ERROR", "UNEXPECTED ERROR OCCURRED")
         finally:
             await self._delete_message(sent_message)
 
     async def release_page(self, callback_query: CallbackQuery):
         parsed = self._parse_pagination_callback_data(callback_query.data)
         if not parsed:
-            await callback_query.answer("Invalid pagination request.", show_alert=False)
+            await callback_query.answer("INVALID PAGINATION REQUEST", show_alert=False)
             return
 
         session_id, requested_page = parsed
         session = self._get_pagination_session(session_id)
         if not session:
-            await callback_query.answer("Session expired. Run /release again.", show_alert=True)
+            await callback_query.answer("SESSION EXPIRED. RUN /RELEASE AGAIN.", show_alert=True)
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
         message_chat_id = callback_query.message.chat.id if callback_query.message else 0
 
         if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
-            await callback_query.answer("This pagination belongs to another user.", show_alert=True)
+            await callback_query.answer("PAGINATION BELONGS TO ANOTHER USER", show_alert=True)
             return
 
         if message_chat_id != session.chat_id:
-            await callback_query.answer("Invalid chat for this pagination.", show_alert=True)
+            await callback_query.answer("INVALID CHAT FOR THIS PAGINATION", show_alert=True)
             return
 
         if not callback_query.message:
-            await callback_query.answer("Message no longer available.", show_alert=True)
+            await callback_query.answer("MESSAGE NO LONGER AVAILABLE", show_alert=True)
             return
 
         try:
@@ -148,141 +171,113 @@ class CommandHandlers:
             await callback_query.answer()
         except Exception as exc:
             self.logger.exception("Failed to update pagination message: %s", exc)
-            await callback_query.answer("Unable to change page right now.", show_alert=False)
+            await callback_query.answer("UNABLE TO CHANGE PAGE RIGHT NOW", show_alert=False)
 
     async def check(self, message: Message):
-        await check_ptp(message)
+        user_id = message.from_user.id if message.from_user else 0
+        chat_id = message.chat.id
+
+        if not self._is_authorized(user_id, chat_id):
+            await self._reply_key_value(message, "ERROR", "NOT AUTHORIZED")
+            return
+
+        if await self.ptp_service.is_available(timeout=5):
+            await self._reply_key_value(message, "PTP STATUS", "AVAILABLE")
+        else:
+            await self._reply_key_value(message, "PTP STATUS", "UNAVAILABLE")
 
     async def auth(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0
 
         if not self._is_owner(requester_id):
-            await message.reply_text("Only owner can use /auth")
+            await self._reply_key_value(message, "ERROR", "ONLY OWNER CAN USE /AUTH")
             return
 
         target_id, source, error_message = self._extract_auth_target(message)
         if error_message:
-            await message.reply_text(error_message)
+            await self._reply_key_value(message, "ERROR", error_message.upper())
             return
 
-        created = self.auth_service.add_authorized(target_id)
-        if created:
+        if self.auth_service.is_configured_id_authorized(target_id):
             await message.reply_text(
-                f"Authorized <code>{target_id}</code> ({source})",
+                (
+                    f"{self._format_key_value('AUTHORIZED', target_id)}\n"
+                    f"{self._format_key_value('SOURCE', f'CONFIG ({source})'.upper())}"
+                ),
                 parse_mode=ParseMode.HTML,
             )
-        else:
-            await message.reply_text(
-                f"Already authorized <code>{target_id}</code> ({source})",
-                parse_mode=ParseMode.HTML,
-            )
+            return
+
+        self.auth_service.add_authorized(target_id)
+        await self._reply_key_value(message, "AUTHORIZED", target_id)
 
     async def unauth(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0
 
         if not self._is_owner(requester_id):
-            await message.reply_text("Only owner can use /unauth")
+            await self._reply_key_value(message, "ERROR", "ONLY OWNER CAN USE /UNAUTH")
             return
 
-        target_id, source, error_message = self._extract_auth_target(message)
+        target_id, _, error_message = self._extract_auth_target(message)
         if error_message:
-            await message.reply_text(error_message)
+            await self._reply_key_value(message, "ERROR", error_message.upper())
             return
 
         if target_id == self.config.owner_id and self.config.owner_id != 0:
-            await message.reply_text("Owner is always authorized and cannot be removed.")
+            await self._reply_key_value(message, "ERROR", "OWNER CANNOT BE REMOVED")
+            return
+
+        if self.auth_service.is_configured_id_authorized(target_id):
+            await message.reply_text(
+                (
+                    f"{self._format_key_value('ERROR', 'ID IS AUTHORIZED FROM CONFIG')}\n"
+                    "<b><u>ACTION:</u></b> <code>REMOVE FROM AUTHORIZED_CHAT_IDS AND RESTART</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         removed = self.auth_service.remove_authorized(target_id)
         if removed:
-            await message.reply_text(
-                f"Unauthorized <code>{target_id}</code> ({source})",
-                parse_mode=ParseMode.HTML,
-            )
+            await self._reply_key_value(message, "UNAUTHORIZED", target_id)
         else:
-            await message.reply_text(
-                f"ID is not authorized: <code>{target_id}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-
-        remaining_reasons = self._authorization_reasons(requester_id, message.chat.id)
-        if remaining_reasons:
-            reason_text = ", ".join(remaining_reasons)
-            await message.reply_text(
-                f"You are still authorized here via: <code>{reason_text}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            await self._reply_key_value(message, "ERROR", f"ID NOT TEMP AUTHORIZED: {target_id}")
 
     async def unauthall(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0
 
         if not self._is_owner(requester_id):
-            await message.reply_text("Only owner can use /unauthall")
+            await self._reply_key_value(message, "ERROR", "ONLY OWNER CAN USE /UNAUTHALL")
             return
 
         removed_count = self.auth_service.clear_authorized()
+        await self._reply_key_value(message, "TEMP IDS REMOVED", removed_count)
+
+    @staticmethod
+    def _format_key_value(label: str, value: str | int) -> str:
+        return f"<b><u>{html.escape(label)}:</u></b> <code>{html.escape(str(value))}</code>"
+
+    async def _reply_key_value(self, message: Message, label: str, value: str | int):
         await message.reply_text(
-            f"Removed <code>{removed_count}</code> authorized ID(s) from database.",
+            self._format_key_value(label, value),
             parse_mode=ParseMode.HTML,
         )
 
-        if self._is_owner(requester_id):
-            await message.reply_text("Owner access remains active by design.")
-
-    async def authlist(self, message: Message):
-        requester_id = message.from_user.id if message.from_user else 0
-
-        if not self._is_owner(requester_id):
-            await message.reply_text("Only owner can use /authlist")
-            return
-
-        authorized_ids = self.auth_service.list_authorized_ids()
-        if not authorized_ids:
-            await message.reply_text("No authorized IDs in database.")
-            return
-
-        display_ids = authorized_ids[:100]
-        lines = ["<b>Authorized IDs</b>"]
-        lines.extend(f"- <code>{entity_id}</code>" for entity_id in display_ids)
-
-        if len(authorized_ids) > len(display_ids):
-            lines.append(f"... and {len(authorized_ids) - len(display_ids)} more")
-
-        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-    async def whoami(self, message: Message):
-        user_id = message.from_user.id if message.from_user else 0
-        chat_id = message.chat.id
-
-        reasons = self._authorization_reasons(user_id, chat_id)
-        is_authorized = bool(reasons)
-        reason_text = ", ".join(reasons) if reasons else "none"
-
-        response = (
-            f"<b>User ID:</b> <code>{user_id}</code>\n"
-            f"<b>Chat ID:</b> <code>{chat_id}</code>\n"
-            f"<b>Authorized:</b> {'yes' if is_authorized else 'no'}\n"
-            f"<b>Reason:</b> <code>{reason_text}</code>"
-        )
-        await message.reply_text(response, parse_mode=ParseMode.HTML)
-
     def _is_authorized(self, user_id: int, chat_id: int) -> bool:
-        return bool(self._authorization_reasons(user_id, chat_id))
+        if self._is_owner(user_id):
+            return True
+        if self.auth_service.is_configured_id_authorized(chat_id):
+            return True
+        if self.auth_service.is_temporary_id_authorized(chat_id):
+            return True
+        if user_id and self.auth_service.is_configured_id_authorized(user_id):
+            return True
+        if user_id and self.auth_service.is_temporary_id_authorized(user_id):
+            return True
+        return False
 
     def _is_owner(self, user_id: int) -> bool:
         return self.config.owner_id != 0 and user_id == self.config.owner_id
-
-    def _authorization_reasons(self, user_id: int, chat_id: int) -> list[str]:
-        reasons: list[str] = []
-
-        if self._is_owner(user_id):
-            reasons.append("owner")
-        if self.auth_service.is_id_authorized(chat_id):
-            reasons.append("chat")
-        if user_id and self.auth_service.is_id_authorized(user_id):
-            reasons.append("user")
-
-        return reasons
 
     def _extract_auth_target(self, message: Message) -> tuple[int, str, str | None]:
         command_parts = message.text.split()[1:] if message.text else []
@@ -313,7 +308,6 @@ class CommandHandlers:
         query: str,
         golden_popcorn: bool,
         results: list[SearchResult],
-        telegraph_url: str | None,
     ) -> ReleasePaginationSession:
         self._prune_expired_sessions()
 
@@ -324,7 +318,6 @@ class CommandHandlers:
             query=query,
             golden_popcorn=golden_popcorn,
             results=results,
-            telegraph_url=telegraph_url,
             created_at=time.time(),
         )
         self._pagination_sessions[session.session_id] = session
@@ -343,6 +336,23 @@ class CommandHandlers:
         ]
         for session_id in expired_session_ids:
             self._pagination_sessions.pop(session_id, None)
+
+    def _schedule_message_redaction(self, session_id: str, message: Message):
+        task = asyncio.create_task(self._redact_message_later(session_id, message))
+        self._redaction_tasks.add(task)
+        task.add_done_callback(self._redaction_tasks.discard)
+
+    async def _redact_message_later(self, session_id: str, message: Message):
+        await asyncio.sleep(self._redaction_delay_seconds)
+        self._pagination_sessions.pop(session_id, None)
+        try:
+            await message.edit_text(
+                "<code>RESULTS REDACTED</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception as exc:
+            self.logger.debug("Failed to redact release message %s: %s", message.id, exc)
 
     def _build_page_response(
         self,
@@ -367,8 +377,6 @@ class CommandHandlers:
         )
 
         message_text = header + body
-        if not session.telegraph_url:
-            message_text += "\n\n<i>Telegraph unavailable, showing paginated in-chat results.</i>"
 
         keyboard_rows: list[list[InlineKeyboardButton]] = []
         nav_buttons: list[InlineKeyboardButton] = []
@@ -391,9 +399,6 @@ class CommandHandlers:
 
         if nav_buttons:
             keyboard_rows.append(nav_buttons)
-
-        if session.telegraph_url:
-            keyboard_rows.append([InlineKeyboardButton("RESULTS", url=session.telegraph_url)])
 
         reply_markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
         return message_text, reply_markup
