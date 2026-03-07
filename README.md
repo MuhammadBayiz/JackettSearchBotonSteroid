@@ -1,6 +1,6 @@
 # JackettSearchBot
 
-Telegram bot for searching Jackett releases with in-chat pagination and checking PTP availability.
+Telegram bot for searching Jackett releases with in-chat pagination.
 
 ## Prerequisites
 
@@ -74,11 +74,9 @@ If required config values are missing, startup stops with an initialization erro
 ## Bot Commands
 
 - `/start` : Verify bot access.
-- `/help` : Show all bot commands and aliases.
+- `/help` : Show all bot commands.
 - `/release <query>` : Search releases (with inline Prev/Next pagination when results span multiple pages).
-- `/release <query> -gp` : Search only Golden Popcorn releases.
-- `/r <query>` : Short alias for `/release`.
-- `/check` : Check PTP availability.
+- `/release <query> --gp` : Search only Golden Popcorn releases.
 - `/auth [id]` : Owner-only. Temporarily authorize current chat by default, or an explicit ID (clears on restart).
 - `/unauth [id]` : Owner-only. Remove temporary authorization for current chat by default, or an explicit ID.
 - `/unauthall` : Owner-only. Remove all temporary in-memory authorizations.
@@ -100,7 +98,6 @@ Authorization rules:
 - `jackett_bot/handlers/commands.py` : Telegram command handlers.
 - `jackett_bot/services/auth.py` : In-memory authorization storage and lookups.
 - `jackett_bot/services/jackett.py` : Jackett query and parsing logic.
-- `jackett_bot/services/ptp.py` : PTP health check helper.
 - `main.py` : Application entry point.
 
 ## Best Practices
@@ -110,4 +107,3 @@ Authorization rules:
 - Keep dependencies in `pyproject.toml` and run `uv lock` after dependency changes.
 - Run the bot with a process manager in production (for example: `systemd`, Docker restart policy, or PM2).
 - Rotate credentials immediately if they are ever exposed.
-

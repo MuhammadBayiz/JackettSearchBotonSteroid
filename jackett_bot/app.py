@@ -7,7 +7,6 @@ from pathlib import Path
 from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
-from .services.ptp import PTPService
 
 
 class JackettSearchBot:
@@ -27,13 +26,11 @@ class JackettSearchBot:
             jackett_url=self.config.jackett_url,
             jackett_api_key=self.config.jackett_api_key,
         )
-        self.ptp_service = PTPService()
 
         self.handlers = CommandHandlers(
             config=self.config,
             auth_service=self.auth_service,
             jackett_service=self.jackett_service,
-            ptp_service=self.ptp_service,
             logger=self.logger,
         )
 
@@ -62,29 +59,29 @@ class JackettSearchBot:
         async def help_handler(client, message):
             await self.handlers.help(message)
 
-        @self.app.on_message(self._filters.command(["release", "relase", "r"]))
+        @self.app.on_message(self._filters.command("release"))
         async def release_handler(client, message):
             await self.handlers.release(message)
-
-        @self.app.on_message(self._filters.command("check"))
-        async def check_handler(client, message):
-            await self.handlers.check(message)
 
         @self.app.on_message(self._filters.command("auth"))
         async def auth_handler(client, message):
             await self.handlers.auth(message)
 
-        @self.app.on_message(self._filters.command(["unauth", "deauth"]))
+        @self.app.on_message(self._filters.command("unauth"))
         async def unauth_handler(client, message):
             await self.handlers.unauth(message)
 
-        @self.app.on_message(self._filters.command(["unauthall", "deauthall"]))
+        @self.app.on_message(self._filters.command("unauthall"))
         async def unauthall_handler(client, message):
             await self.handlers.unauthall(message)
 
         @self.app.on_callback_query(self._filters.regex(r"^release_page:"))
         async def release_page_handler(client, callback_query):
             await self.handlers.release_page(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^release_close:"))
+        async def release_close_handler(client, callback_query):
+            await self.handlers.release_close(callback_query)
 
     def run(self):
         self.logger.info("Starting bot runtime.")
@@ -115,7 +112,6 @@ class JackettSearchBot:
     def _shutdown_services(self):
         async def _close_services():
             await self.jackett_service.close()
-            await self.ptp_service.close()
 
         try:
             asyncio.run(_close_services())

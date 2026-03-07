@@ -14,6 +14,7 @@ class SearchResult:
     title: str
     age: str
     size: str
+    size_bytes: int
 
     def as_html(self) -> str:
         return (
@@ -120,6 +121,7 @@ def parse_search_results(response_content: bytes, golden_popcorn: bool = False) 
                 title=title,
                 age=format_pub_date(pub_date),
                 size=convert_size(size_bytes),
+                size_bytes=size_bytes,
             )
         )
 
