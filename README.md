@@ -25,6 +25,7 @@ uv sync
 Notes:
 - `uv sync` creates a local `.venv` automatically.
 - You usually do not need to activate it manually when using `uv run`.
+- `rich` is used for colored, cleaner terminal logging.
 - `tgcrypto` is installed automatically on Python 3.10-3.12; on 3.13+ it is skipped unless you have C++ build tools.
 
 3. Create `config.env` from the template and fill values.
@@ -70,12 +71,11 @@ uv run python main.py
 ```
 
 If required config values are missing, startup stops with an initialization error and asks you to fill `config.env` first.
+If Telegram returns a startup flood wait, the bot exits with a clear message and expected wait time.
 
 ## Bot Commands
 
-- `/start` : Verify bot access.
-- `/help` : Show all bot commands.
-- `/release <query>` : Search releases (with inline Prev/Next pagination when results span multiple pages).
+- `/release <query>` : Search releases (with inline `PREV`/`NEXT` pagination when results span multiple pages).
 - `/release <query> --gp` : Search only Golden Popcorn releases.
 - `/auth [id]` : Owner-only. Temporarily authorize current chat by default, or an explicit ID (clears on restart).
 - `/unauth [id]` : Owner-only. Remove temporary authorization for current chat by default, or an explicit ID.
@@ -90,6 +90,10 @@ Authorization rules:
 - Access is granted if any one applies: owner, configured authorized ID, or temporary authorized ID.
 - Because of that, removing one grant may still leave another grant active.
 - `/unauthall` clears only temporary in-memory grants; configured IDs and owner access still remain active.
+
+Rate limit behavior:
+- Telegram `FloodWait` during normal bot operations is handled gracefully (send/edit/delete/callback paths).
+- Temporary rate-limit responses are returned to users instead of crashing handler execution.
 
 ## Project Structure
 
