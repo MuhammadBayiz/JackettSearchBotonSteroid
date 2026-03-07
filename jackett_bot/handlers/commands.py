@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import httpx
 from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from ..config import BotConfig
@@ -23,6 +24,19 @@ class ReleasePaginationSession:
     golden_popcorn: bool
     results: list[SearchResult]
     created_at: float
+
+
+@dataclass(frozen=True)
+class AccessDecision:
+    allowed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class AuthTarget:
+    entity_id: int
+    entity_type: str
+    source: str
 
 
 class CommandHandlers:
@@ -42,34 +56,13 @@ class CommandHandlers:
         self._redaction_delay_seconds = self.config.redact_after_seconds
         self._redaction_tasks: set[asyncio.Task] = set()
 
-    async def start(self, message: Message):
-        user_id = message.from_user.id if message.from_user else 0
-        chat_id = message.chat.id
-
-        if self._is_authorized(user_id, chat_id):
-            await self._reply_text(message, "BOT STARTED")
-        else:
-            await self._reply_text(message, "NOT AUTHORIZED")
-
-    async def help(self, message: Message):
-        help_text = (
-            "<b><u>BOT COMMANDS:</u></b>\n\n"
-            "<code>/help</code> - Show this command list.\n"
-            "<code>/start</code> - Verify bot access.\n"
-            "<code>/release &lt;query&gt;</code> - Search releases with pagination.\n"
-            "<code>/release &lt;query&gt; --gp</code> - Search only Golden Popcorn releases.\n"
-            "<code>/auth [id]</code> - Owner-only temporary authorize.\n"
-            "<code>/unauth [id]</code> - Owner-only remove temporary authorization.\n"
-            "<code>/unauthall</code> - Owner-only clear temporary authorizations."
-        )
-        await message.reply_text(help_text, parse_mode=ParseMode.HTML)
-
     async def release(self, message: Message):
         user_id = message.from_user.id if message.from_user else 0
         chat_id = message.chat.id
+        access = self._get_access_decision(user_id, chat_id)
 
-        if not self._is_authorized(user_id, chat_id):
-            await self._reply_text(message, "NOT AUTHORIZED")
+        if not access.allowed:
+            await self._reply_text(message, f"NOT AUTHORIZED ({access.reason})")
             return
 
         command_parts = message.text.split()[1:] if message.text else []
@@ -85,10 +78,15 @@ class CommandHandlers:
             await self._reply_text(message, "PROVIDE QUERY OR IMDB ID/URL")
             return
 
-        sent_message = await message.reply_text(
-            self._format_reply_text("SEARCHING..."),
-            parse_mode=ParseMode.HTML,
+        self.logger.info(
+            "Search requested | query=%s | golden_popcorn=%s | user_id=%s | chat_id=%s",
+            query,
+            golden_popcorn,
+            user_id,
+            chat_id,
         )
+
+        sent_message = await self._try_send_searching_message(message)
 
         try:
             all_results = await self.jackett_service.search(query, golden_popcorn=golden_popcorn)
@@ -108,11 +106,21 @@ class CommandHandlers:
             )
 
             message_text, reply_markup = self._build_page_response(session, page=1)
-            result_message = await message.reply_text(
-                message_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
+            try:
+                result_message = await message.reply_text(
+                    message_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
+            except FloodWait as exc:
+                self.logger.warning(
+                    "FloodWait while sending release results | wait_seconds=%s | chat_id=%s",
+                    exc.value,
+                    chat_id,
+                )
+                await self._reply_text(message, "TELEGRAM RATE LIMIT. TRY AGAIN LATER.")
+                return
+
             self._schedule_message_redaction(session.session_id, result_message)
         except httpx.HTTPStatusError as http_err:
             self.logger.error("HTTP error occurred: %s", http_err)
@@ -124,33 +132,34 @@ class CommandHandlers:
             self.logger.exception("Unexpected error occurred: %s", exc)
             await self._reply_text(message, "UNEXPECTED ERROR OCCURRED")
         finally:
-            await self._delete_message(sent_message)
+            if sent_message is not None:
+                await self._delete_message(sent_message)
 
     async def release_page(self, callback_query: CallbackQuery):
         parsed = self._parse_pagination_callback_data(callback_query.data)
         if not parsed:
-            await callback_query.answer("INVALID PAGINATION REQUEST", show_alert=False)
+            await self._answer_callback(callback_query, "INVALID PAGINATION REQUEST", show_alert=False)
             return
 
         session_id, requested_page = parsed
         session = self._get_pagination_session(session_id)
         if not session:
-            await callback_query.answer("SESSION EXPIRED. RUN /RELEASE AGAIN.", show_alert=True)
+            await self._answer_callback(callback_query, "SESSION EXPIRED. RUN /RELEASE AGAIN.", show_alert=True)
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
         message_chat_id = callback_query.message.chat.id if callback_query.message else 0
 
         if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
-            await callback_query.answer("PAGINATION BELONGS TO ANOTHER USER", show_alert=True)
+            await self._answer_callback(callback_query, "PAGINATION BELONGS TO ANOTHER USER", show_alert=True)
             return
 
         if message_chat_id != session.chat_id:
-            await callback_query.answer("INVALID CHAT FOR THIS PAGINATION", show_alert=True)
+            await self._answer_callback(callback_query, "INVALID CHAT FOR THIS PAGINATION", show_alert=True)
             return
 
         if not callback_query.message:
-            await callback_query.answer("MESSAGE NO LONGER AVAILABLE", show_alert=True)
+            await self._answer_callback(callback_query, "MESSAGE NO LONGER AVAILABLE", show_alert=True)
             return
 
         try:
@@ -160,34 +169,42 @@ class CommandHandlers:
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
             )
-            await callback_query.answer()
+            await self._answer_callback(callback_query)
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while changing release page | wait_seconds=%s | session_id=%s",
+                exc.value,
+                session_id,
+            )
+            await self._answer_callback(callback_query, "RATE LIMITED. TRY AGAIN LATER.", show_alert=False)
         except Exception as exc:
             self.logger.exception("Failed to update pagination message: %s", exc)
-            await callback_query.answer("UNABLE TO CHANGE PAGE RIGHT NOW", show_alert=False)
+            await self._answer_callback(callback_query, "UNABLE TO CHANGE PAGE RIGHT NOW", show_alert=False)
+
     async def release_close(self, callback_query: CallbackQuery):
         session_id = self._parse_close_callback_data(callback_query.data)
         if not session_id:
-            await callback_query.answer("INVALID CLOSE REQUEST", show_alert=False)
+            await self._answer_callback(callback_query, "INVALID CLOSE REQUEST", show_alert=False)
             return
 
         session = self._get_pagination_session(session_id)
         if not session:
-            await callback_query.answer("SESSION EXPIRED", show_alert=False)
+            await self._answer_callback(callback_query, "SESSION EXPIRED", show_alert=False)
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
         message_chat_id = callback_query.message.chat.id if callback_query.message else 0
 
         if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
-            await callback_query.answer("ONLY REQUESTER OR OWNER CAN CLOSE", show_alert=True)
+            await self._answer_callback(callback_query, "ONLY REQUESTER OR OWNER CAN CLOSE", show_alert=True)
             return
 
         if message_chat_id != session.chat_id:
-            await callback_query.answer("INVALID CHAT FOR THIS REQUEST", show_alert=True)
+            await self._answer_callback(callback_query, "INVALID CHAT FOR THIS REQUEST", show_alert=True)
             return
 
         if not callback_query.message:
-            await callback_query.answer("MESSAGE NO LONGER AVAILABLE", show_alert=True)
+            await self._answer_callback(callback_query, "MESSAGE NO LONGER AVAILABLE", show_alert=True)
             return
 
         self._pagination_sessions.pop(session_id, None)
@@ -198,10 +215,17 @@ class CommandHandlers:
                 parse_mode=ParseMode.HTML,
                 reply_markup=None,
             )
-            await callback_query.answer("RESULTS CLOSED", show_alert=False)
+            await self._answer_callback(callback_query, "RESULTS CLOSED", show_alert=False)
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while closing release message | wait_seconds=%s | session_id=%s",
+                exc.value,
+                session_id,
+            )
+            await self._answer_callback(callback_query, "RATE LIMITED. TRY AGAIN LATER.", show_alert=False)
         except Exception as exc:
             self.logger.exception("Failed to close release message: %s", exc)
-            await callback_query.answer("UNABLE TO CLOSE RIGHT NOW", show_alert=False)
+            await self._answer_callback(callback_query, "UNABLE TO CLOSE RIGHT NOW", show_alert=False)
 
     async def auth(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0
@@ -210,23 +234,30 @@ class CommandHandlers:
             await self._reply_text(message, "ONLY OWNER CAN USE /AUTH")
             return
 
-        target_id, source, error_message = self._extract_auth_target(message)
+        target, error_message = self._extract_auth_target(message)
         if error_message:
             await self._reply_text(message, error_message.upper())
             return
 
-        if self.auth_service.is_configured_id_authorized(target_id):
-            await message.reply_text(
-                (
-                    f"{self._format_reply_text(target_id)}\n"
-                    f"{self._format_reply_text(f'CONFIG ({source})'.upper())}"
-                ),
-                parse_mode=ParseMode.HTML,
+        if self.auth_service.is_configured_id_authorized(target.entity_id):
+            await self._reply_text(
+                message,
+                f"{target.entity_type.upper()} {target.entity_id} ALREADY AUTHORIZED VIA CONFIG",
             )
             return
 
-        self.auth_service.add_authorized(target_id)
-        await self._reply_text(message, target_id)
+        if self.auth_service.is_temporary_id_authorized(target.entity_id):
+            await self._reply_text(
+                message,
+                f"{target.entity_type.upper()} {target.entity_id} ALREADY TEMP AUTHORIZED",
+            )
+            return
+
+        self.auth_service.add_authorized(target.entity_id)
+        await self._reply_text(
+            message,
+            f"AUTHORIZED {target.entity_type.upper()} {target.entity_id} ({target.source.upper()})",
+        )
 
     async def unauth(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0
@@ -235,30 +266,33 @@ class CommandHandlers:
             await self._reply_text(message, "ONLY OWNER CAN USE /UNAUTH")
             return
 
-        target_id, _, error_message = self._extract_auth_target(message)
+        target, error_message = self._extract_auth_target(message)
         if error_message:
             await self._reply_text(message, error_message.upper())
             return
 
-        if target_id == self.config.owner_id and self.config.owner_id != 0:
+        if target.entity_id == self.config.owner_id and self.config.owner_id != 0:
             await self._reply_text(message, "OWNER CANNOT BE REMOVED")
             return
 
-        if self.auth_service.is_configured_id_authorized(target_id):
-            await message.reply_text(
-                (
-                    f"{self._format_reply_text('ID IS AUTHORIZED FROM CONFIG')}\n"
-                    f"{self._format_reply_text('REMOVE FROM AUTHORIZED_CHAT_IDS AND RESTART')}"
-                ),
-                parse_mode=ParseMode.HTML,
+        if self.auth_service.is_configured_id_authorized(target.entity_id):
+            await self._reply_text(
+                message,
+                f"{target.entity_type.upper()} {target.entity_id} IS AUTHORIZED VIA CONFIG",
             )
             return
 
-        removed = self.auth_service.remove_authorized(target_id)
+        removed = self.auth_service.remove_authorized(target.entity_id)
         if removed:
-            await self._reply_text(message, target_id)
+            await self._reply_text(
+                message,
+                f"REMOVED TEMP AUTH FOR {target.entity_type.upper()} {target.entity_id}",
+            )
         else:
-            await self._reply_text(message, f"ID NOT TEMP AUTHORIZED: {target_id}")
+            await self._reply_text(
+                message,
+                f"{target.entity_type.upper()} {target.entity_id} NOT TEMP AUTHORIZED",
+            )
 
     async def unauthall(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0
@@ -268,54 +302,108 @@ class CommandHandlers:
             return
 
         removed_count = self.auth_service.clear_authorized()
-        await self._reply_text(message, removed_count)
+        await self._reply_text(message, f"CLEARED {removed_count} TEMP AUTHORIZATIONS")
 
     @staticmethod
     def _format_reply_text(value: str | int) -> str:
         return f"<code>{html.escape(str(value))}</code>"
 
     async def _reply_text(self, message: Message, value: str | int):
-        await message.reply_text(
-            self._format_reply_text(value),
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await message.reply_text(
+                self._format_reply_text(value),
+                parse_mode=ParseMode.HTML,
+            )
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while sending reply | wait_seconds=%s | message=%s",
+                exc.value,
+                value,
+            )
+
+    async def _try_send_searching_message(self, message: Message) -> Message | None:
+        try:
+            return await message.reply_text(
+                self._format_reply_text("SEARCHING..."),
+                parse_mode=ParseMode.HTML,
+            )
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while sending searching message | wait_seconds=%s | chat_id=%s",
+                exc.value,
+                message.chat.id,
+            )
+            return None
+
+    async def _answer_callback(
+        self,
+        callback_query: CallbackQuery,
+        text: str | None = None,
+        show_alert: bool = False,
+    ):
+        try:
+            if text is None:
+                await callback_query.answer()
+            else:
+                await callback_query.answer(text, show_alert=show_alert)
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while answering callback | wait_seconds=%s | data=%s",
+                exc.value,
+                callback_query.data,
+            )
+
+    def _get_access_decision(self, user_id: int, chat_id: int) -> AccessDecision:
+        if self._is_owner(user_id):
+            return AccessDecision(True, "owner")
+        if self.auth_service.is_configured_id_authorized(chat_id):
+            return AccessDecision(True, "configured chat")
+        if self.auth_service.is_temporary_id_authorized(chat_id):
+            return AccessDecision(True, "temporary chat")
+        if user_id and self.auth_service.is_configured_id_authorized(user_id):
+            return AccessDecision(True, "configured user")
+        if user_id and self.auth_service.is_temporary_id_authorized(user_id):
+            return AccessDecision(True, "temporary user")
+        return AccessDecision(False, "no matching user or chat authorization")
 
     def _is_authorized(self, user_id: int, chat_id: int) -> bool:
-        if self._is_owner(user_id):
-            return True
-        if self.auth_service.is_configured_id_authorized(chat_id):
-            return True
-        if self.auth_service.is_temporary_id_authorized(chat_id):
-            return True
-        if user_id and self.auth_service.is_configured_id_authorized(user_id):
-            return True
-        if user_id and self.auth_service.is_temporary_id_authorized(user_id):
-            return True
-        return False
+        return self._get_access_decision(user_id, chat_id).allowed
 
     def _is_owner(self, user_id: int) -> bool:
         return self.config.owner_id != 0 and user_id == self.config.owner_id
 
-    def _extract_auth_target(self, message: Message) -> tuple[int, str, str | None]:
+    def _extract_auth_target(self, message: Message) -> tuple[AuthTarget | None, str | None]:
         command_parts = message.text.split()[1:] if message.text else []
 
         if command_parts:
             raw_target = command_parts[0].strip()
             try:
-                return int(raw_target), "explicit id", None
+                target_id = int(raw_target)
             except ValueError:
-                return 0, "", "Invalid target ID. Use /auth <id> or reply to a user message."
+                return None, "Invalid target ID. Use /auth <id> or reply to a user message."
+            return AuthTarget(target_id, self._infer_entity_type(target_id), "explicit id"), None
 
         if message.reply_to_message and message.reply_to_message.from_user:
-            return message.reply_to_message.from_user.id, "replied user", None
+            target_id = message.reply_to_message.from_user.id
+            return AuthTarget(target_id, "user", "replied user"), None
 
-        return message.chat.id, "current chat", None
+        target_id = message.chat.id
+        return AuthTarget(target_id, "chat", "current chat"), None
+
+    @staticmethod
+    def _infer_entity_type(entity_id: int) -> str:
+        return "chat" if entity_id < 0 else "user"
 
     async def _delete_message(self, message: Message):
         try:
             await message.delete()
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while deleting message | wait_seconds=%s | message_id=%s",
+                exc.value,
+                message.id,
+            )
         except Exception:
-            # Deleting loading message can fail if Telegram already removed it.
             pass
 
     def _create_pagination_session(
@@ -368,6 +456,12 @@ class CommandHandlers:
                 parse_mode=ParseMode.HTML,
                 reply_markup=None,
             )
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while redacting release message | wait_seconds=%s | message_id=%s",
+                exc.value,
+                message.id,
+            )
         except Exception as exc:
             self.logger.debug("Failed to redact release message %s: %s", message.id, exc)
 
@@ -389,7 +483,7 @@ class CommandHandlers:
         header_suffix = " (GP)" if session.golden_popcorn else ""
         header = (
             f"<b><u>SEARCH RESULTS{header_suffix}</u></b>\n"
-            f"<b>Query:</b> <code>{session.query}</code>\n"
+            f"<b>Query:</b> <code>{html.escape(session.query)}</code>\n"
             f"<b>Page:</b> {page}/{total_pages} | <b>Total:</b> {len(session.results)}\n\n"
         )
 
@@ -401,7 +495,7 @@ class CommandHandlers:
         if total_pages > 1 and page > 1:
             nav_buttons.append(
                 InlineKeyboardButton(
-                    "Prev",
+                    "PREV",
                     callback_data=f"release_page:{session.session_id}:{page - 1}",
                 )
             )
@@ -409,7 +503,7 @@ class CommandHandlers:
         if total_pages > 1 and page < total_pages:
             nav_buttons.append(
                 InlineKeyboardButton(
-                    "Next",
+                    "NEXT",
                     callback_data=f"release_page:{session.session_id}:{page + 1}",
                 )
             )
@@ -420,7 +514,7 @@ class CommandHandlers:
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    "Close",
+                    "CLOSE",
                     callback_data=f"release_close:{session.session_id}",
                 )
             ]

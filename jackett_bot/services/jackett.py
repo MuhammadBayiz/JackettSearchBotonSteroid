@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ class SearchResult:
 
     def as_html(self) -> str:
         return (
-            f"<b>Title:</b> <code>{self.title}</code>\n"
+            f"<b>Title:</b> <code>{html.escape(self.title)}</code>\n"
             f"<b>Age:</b> {self.age}\n"
             f"<b>Size:</b> {self.size}\n"
         )
@@ -138,3 +139,4 @@ def _safe_int(value: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+

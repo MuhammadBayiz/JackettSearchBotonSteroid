@@ -7,6 +7,12 @@ from pathlib import Path
 from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
+from pyrogram.errors import FloodWait
+
+try:
+    from rich.logging import RichHandler
+except ImportError:
+    RichHandler = None
 
 
 class JackettSearchBot:
@@ -39,7 +45,6 @@ class JackettSearchBot:
             api_id=self.config.api_id,
             api_hash=self.config.api_hash,
             bot_token=self.config.token,
-            in_memory=True,
         )
         self._register_handlers()
 
@@ -51,14 +56,6 @@ class JackettSearchBot:
         return bot
 
     def _register_handlers(self):
-        @self.app.on_message(self._filters.command("start"))
-        async def start_handler(client, message):
-            await self.handlers.start(message)
-
-        @self.app.on_message(self._filters.command("help"))
-        async def help_handler(client, message):
-            await self.handlers.help(message)
-
         @self.app.on_message(self._filters.command("release"))
         async def release_handler(client, message):
             await self.handlers.release(message)
@@ -96,12 +93,18 @@ class JackettSearchBot:
                     "or a stale session lock exists."
                 )
                 self.logger.error(
-                    "Action: stop other instances and retry. This build uses in-memory session mode to avoid "
-                    "persistent session locks."
+                    "Action: stop other instances, remove any stale session lock if needed, and retry. "
+                    "This build uses a persisted session to reduce repeated bot re-authorization on restart."
                 )
                 raise SystemExit(2) from exc
             self.logger.exception("SQLite operational error while starting bot.")
             raise
+        except FloodWait as exc:
+            self.logger.error(
+                "Telegram rate limited bot authorization/startup. Wait %s seconds before retrying.",
+                exc.value,
+            )
+            raise SystemExit(3) from exc
         except Exception:
             self.logger.exception("Fatal runtime error. Bot stopped unexpectedly.")
             raise
@@ -122,11 +125,21 @@ class JackettSearchBot:
         log_path = Path(self.config.log_file_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        console_handler = logging.StreamHandler()
+        if RichHandler is not None:
+            console_handler = RichHandler(
+                show_time=True,
+                show_level=True,
+                show_path=False,
+                markup=False,
+                rich_tracebacks=True,
+            )
+            console_format = "%(message)s"
+        else:
+            console_handler = logging.StreamHandler()
+            console_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
         console_handler.setLevel(self.config.console_log_level)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-        )
+        console_handler.setFormatter(logging.Formatter(console_format))
 
         file_handler = RotatingFileHandler(
             filename=log_path,
@@ -145,10 +158,15 @@ class JackettSearchBot:
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.DEBUG)
         root_logger.handlers.clear()
-        root_logger.addHandler(console_handler)
         root_logger.addHandler(file_handler)
 
         logger = logging.getLogger("JackettSearchBot")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(console_handler)
+        logger.propagate = True
+
+        self._configure_third_party_loggers()
         logger.info("JackettSearchBot initialized.")
         logger.info(
             "Logging configured | console=%s | file=%s | path=%s",
@@ -157,3 +175,7 @@ class JackettSearchBot:
             str(log_path.resolve()),
         )
         return logger
+
+    def _configure_third_party_loggers(self):
+        for logger_name in ("pyrogram", "httpx", "httpcore", "asyncio"):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)

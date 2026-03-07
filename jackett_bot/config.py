@@ -40,7 +40,7 @@ class BotConfig:
             api_hash=_require_env("API_HASH"),
             jackett_api_key=_require_env("JACKETT_API_KEY"),
             jackett_url=_require_env("JACKETT_URL"),
-            default_max_results=_parse_int_env("MAX_RESULTS", default=10),
+            default_max_results=_parse_positive_int_env("MAX_RESULTS", default=10),
             redact_after_seconds=_parse_positive_int_env("REDACT_AFTER_SECONDS", default=300),
             log_file_path=_parse_str_env("LOG_FILE_PATH", default="logs/jackett_bot.log"),
             console_log_level=_parse_log_level_env("CONSOLE_LOG_LEVEL", default="INFO"),
@@ -119,3 +119,4 @@ def _parse_authorized_chat_ids(raw_chat_ids: str) -> list[int]:
         except ValueError as exc:
             raise ValueError(f"Invalid chat id in AUTHORIZED_CHAT_IDS: {trimmed!r}") from exc
     return chat_ids
+

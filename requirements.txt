@@ -1,4 +1,5 @@
 pyrogram
 python-dotenv
 httpx
+rich
 tgcrypto; python_version < "3.13"
