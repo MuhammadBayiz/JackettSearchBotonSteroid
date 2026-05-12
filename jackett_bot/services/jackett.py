@@ -53,7 +53,9 @@ class JackettService:
             f"?apikey={self.jackett_api_key}&t=search&q={encoded_query}"
         )
 
-    async def search(self, query: str, golden_popcorn: bool = False, timeout: int = 15) -> list[SearchResult]:
+    async def search(
+        self, query: str, golden_popcorn: bool = False, timeout: int = 15
+    ) -> list[SearchResult]:
         response = await self._client.get(self.build_search_url(query), timeout=timeout)
         response.raise_for_status()
 
@@ -99,7 +101,9 @@ def format_pub_date(pub_date: str) -> str:
     return f"{seconds} s"
 
 
-def parse_search_results(response_content: bytes, golden_popcorn: bool = False) -> list[SearchResult]:
+def parse_search_results(
+    response_content: bytes, golden_popcorn: bool = False
+) -> list[SearchResult]:
     root = ET.fromstring(response_content)
     results: list[SearchResult] = []
 
@@ -139,4 +143,3 @@ def _safe_int(value: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
