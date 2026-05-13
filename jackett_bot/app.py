@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
+from .services.tmdb import TMDbService
 from pyrogram.errors import FloodWait
 
 try:
@@ -32,11 +33,15 @@ class JackettSearchBot:
             jackett_url=self.config.jackett_url,
             jackett_api_key=self.config.jackett_api_key,
         )
+        self.tmdb_service = TMDbService(
+            tmdb_api_key=self.config.tmdb_api_key,
+        )
 
         self.handlers = CommandHandlers(
             config=self.config,
             auth_service=self.auth_service,
             jackett_service=self.jackett_service,
+            tmdb_service=self.tmdb_service,
             logger=self.logger,
         )
 
@@ -80,12 +85,18 @@ class JackettSearchBot:
         async def release_close_handler(client, callback_query):
             await self.handlers.release_close(callback_query)
 
+        @self.app.on_inline_query()
+        async def inline_query_handler(client, inline_query):
+            await self.handlers.inline_query(inline_query)
+
     def run(self):
         self.logger.info("Starting bot runtime.")
         try:
             self.app.run()
         except KeyboardInterrupt:
-            self.logger.info("Stop signal received (KeyboardInterrupt). Exiting gracefully.")
+            self.logger.info(
+                "Stop signal received (KeyboardInterrupt). Exiting gracefully."
+            )
         except sqlite3.OperationalError as exc:
             if "database is locked" in str(exc).lower():
                 self.logger.error(
@@ -115,11 +126,14 @@ class JackettSearchBot:
     def _shutdown_services(self):
         async def _close_services():
             await self.jackett_service.close()
+            await self.tmdb_service.close()
 
         try:
             asyncio.run(_close_services())
         except Exception:
-            self.logger.exception("Error while closing service clients during shutdown.")
+            self.logger.exception(
+                "Error while closing service clients during shutdown."
+            )
 
     def _build_logger(self) -> logging.Logger:
         log_path = Path(self.config.log_file_path)

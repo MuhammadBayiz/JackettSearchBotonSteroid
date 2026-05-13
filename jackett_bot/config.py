@@ -12,6 +12,7 @@ class BotConfig:
     api_hash: str
     jackett_api_key: str
     jackett_url: str
+    tmdb_api_key: str
     default_max_results: int
     redact_after_seconds: int
     log_file_path: str
@@ -30,6 +31,7 @@ class BotConfig:
                 "API_HASH",
                 "JACKETT_API_KEY",
                 "JACKETT_URL",
+                "TMDB_API_KEY",
                 "OWNER_ID",
             ]
         )
@@ -40,18 +42,27 @@ class BotConfig:
             api_hash=_require_env("API_HASH"),
             jackett_api_key=_require_env("JACKETT_API_KEY"),
             jackett_url=_require_env("JACKETT_URL"),
+            tmdb_api_key=_require_env("TMDB_API_KEY"),
             default_max_results=_parse_positive_int_env("MAX_RESULTS", default=10),
-            redact_after_seconds=_parse_positive_int_env("REDACT_AFTER_SECONDS", default=300),
-            log_file_path=_parse_str_env("LOG_FILE_PATH", default="logs/jackett_bot.log"),
+            redact_after_seconds=_parse_positive_int_env(
+                "REDACT_AFTER_SECONDS", default=300
+            ),
+            log_file_path=_parse_str_env(
+                "LOG_FILE_PATH", default="logs/jackett_bot.log"
+            ),
             console_log_level=_parse_log_level_env("CONSOLE_LOG_LEVEL", default="INFO"),
             file_log_level=_parse_log_level_env("FILE_LOG_LEVEL", default="DEBUG"),
-            authorized_chat_ids=_parse_authorized_chat_ids(os.getenv("AUTHORIZED_CHAT_IDS", "")),
+            authorized_chat_ids=_parse_authorized_chat_ids(
+                os.getenv("AUTHORIZED_CHAT_IDS", "")
+            ),
             owner_id=_parse_int_env("OWNER_ID", required=True),
         )
 
 
 def _validate_required_env(keys: list[str]):
-    missing_keys = [key for key in keys if os.getenv(key) is None or not os.getenv(key, "").strip()]
+    missing_keys = [
+        key for key in keys if os.getenv(key) is None or not os.getenv(key, "").strip()
+    ]
     if missing_keys:
         missing_list = ", ".join(missing_keys)
         raise ValueError(
@@ -80,7 +91,9 @@ def _parse_int_env(key: str, default: int | None = None, required: bool = False)
     try:
         return int(raw.strip())
     except ValueError as exc:
-        raise ValueError(f"Environment variable {key} must be an integer, got: {raw!r}") from exc
+        raise ValueError(
+            f"Environment variable {key} must be an integer, got: {raw!r}"
+        ) from exc
 
 
 def _parse_positive_int_env(key: str, default: int) -> int:
@@ -117,6 +130,7 @@ def _parse_authorized_chat_ids(raw_chat_ids: str) -> list[int]:
         try:
             chat_ids.append(int(trimmed))
         except ValueError as exc:
-            raise ValueError(f"Invalid chat id in AUTHORIZED_CHAT_IDS: {trimmed!r}") from exc
+            raise ValueError(
+                f"Invalid chat id in AUTHORIZED_CHAT_IDS: {trimmed!r}"
+            ) from exc
     return chat_ids
-

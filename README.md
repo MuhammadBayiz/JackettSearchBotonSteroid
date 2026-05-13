@@ -43,6 +43,9 @@ API_HASH=your_api_hash_here
 JACKETT_API_KEY=your_jackett_api_key_here
 JACKETT_URL=http://localhost:9117
 
+# TMDb Configuration
+TMDB_API_KEY=your_tmdb_api_key_here
+
 # Authorization
 AUTHORIZED_CHAT_IDS=id1,id2,id3
 OWNER_ID=123456789
@@ -75,6 +78,7 @@ If Telegram returns a startup flood wait, the bot exits with a clear message and
 
 ## Bot Commands
 
+- **Inline Search** : Type `@your_bot_username <query>` to search TMDb. Pressing a result will send `/release <imdb_id>` to the chat to search Jackett for that specific title.
 - `/release <query>` : Search releases (with inline `PREV`/`NEXT` pagination when results span multiple pages).
 - `/release <query> --gp` : Search only Golden Popcorn releases.
 - `/auth [id]` : Owner-only. Temporarily authorize current chat by default, or an explicit ID (clears on restart).

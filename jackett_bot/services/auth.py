@@ -17,7 +17,10 @@ class AuthorizationService:
     def add_authorized(self, entity_id: int) -> bool:
         normalized_id = self._normalize_id(entity_id)
         with self._lock:
-            if normalized_id in self._configured_ids or normalized_id in self._temporary_ids:
+            if (
+                normalized_id in self._configured_ids
+                or normalized_id in self._temporary_ids
+            ):
                 return False
             self._temporary_ids.add(normalized_id)
             return True

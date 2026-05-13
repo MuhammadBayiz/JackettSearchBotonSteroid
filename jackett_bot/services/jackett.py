@@ -99,7 +99,9 @@ def format_pub_date(pub_date: str) -> str:
     return f"{seconds} s"
 
 
-def parse_search_results(response_content: bytes, golden_popcorn: bool = False) -> list[SearchResult]:
+def parse_search_results(
+    response_content: bytes, golden_popcorn: bool = False
+) -> list[SearchResult]:
     root = ET.fromstring(response_content)
     results: list[SearchResult] = []
 
@@ -139,4 +141,3 @@ def _safe_int(value: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
