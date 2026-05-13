@@ -53,7 +53,9 @@ class JackettService:
             f"?apikey={self.jackett_api_key}&t=search&q={encoded_query}"
         )
 
-    async def search(self, query: str, golden_popcorn: bool = False, timeout: int = 60) -> list[SearchResult]:
+    async def search(
+        self, query: str, golden_popcorn: bool = False, timeout: int = 60
+    ) -> list[SearchResult]:
         response = await self._client.get(self.build_search_url(query), timeout=timeout)
         response.raise_for_status()
 

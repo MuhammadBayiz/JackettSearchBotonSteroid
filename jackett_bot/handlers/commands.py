@@ -362,25 +362,10 @@ class CommandHandlers:
         await self._reply_text(message, f"CLEARED {removed_count} TEMP AUTHORIZATIONS")
 
     async def inline_query(self, inline_query: InlineQuery):
-        user_id = inline_query.from_user.id if inline_query.from_user else 0
-        access = self._get_access_decision(
-            user_id, user_id
-        )  # For inline queries, chat_id is usually the user_id
-
-        if not access.allowed:
-            await inline_query.answer(
-                results=[
-                    InlineQueryResultArticle(
-                        title="Not Authorized",
-                        input_message_content=InputTextMessageContent(
-                            f"NOT AUTHORIZED ({access.reason})"
-                        ),
-                        description=access.reason,
-                    )
-                ],
-                cache_time=0,
-            )
-            return
+        # We allow inline queries for everyone since the bot will only respond to
+        # the resulting `/release <imdb_id>` command in authorized chats anyway.
+        # Also, Pyrogram `InlineQuery` does not provide the target `chat.id` in all cases,
+        # so checking group authorization at this stage is not feasible.
 
         query = inline_query.query.strip()
         if not query:
