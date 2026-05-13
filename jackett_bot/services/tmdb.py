@@ -12,11 +12,20 @@ class TMDbSearchResult:
     release_date: str
     popularity: float
     imdb_id: str | None = None
+    poster_path: str | None = None
+    overview: str | None = None
+    original_language: str | None = None
 
     @property
     def display_title(self) -> str:
         date_str = f" ({self.release_date[:4]})" if self.release_date else ""
         return f"{self.title}{date_str}"
+
+    @property
+    def thumb_url(self) -> str | None:
+        if not self.poster_path:
+            return None
+        return f"https://image.tmdb.org/t/p/w200{self.poster_path}"
 
 
 class TMDbService:
@@ -60,6 +69,9 @@ class TMDbService:
                     media_type=media_type,
                     release_date=release_date,
                     popularity=item.get("popularity", 0.0),
+                    poster_path=item.get("poster_path"),
+                    overview=item.get("overview") or None,
+                    original_language=item.get("original_language") or None,
                 )
             )
 
@@ -91,6 +103,9 @@ class TMDbService:
                 release_date=result.release_date,
                 popularity=result.popularity,
                 imdb_id=imdb_id,
+                poster_path=result.poster_path,
+                overview=result.overview,
+                original_language=result.original_language,
             )
         except Exception:
             return result

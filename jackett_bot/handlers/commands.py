@@ -380,13 +380,24 @@ class CommandHandlers:
                 if not result.imdb_id:
                     continue
 
+                lang = (result.original_language or "").upper()
+                media_label = result.media_type.capitalize()
+                meta = f"{media_label}  |  {lang}" if lang else media_label
+                overview = result.overview or ""
+                if len(overview) > 120:
+                    overview = overview[:117].rstrip() + "..."
+                description = f"{meta}\n{overview}" if overview else meta
+
                 inline_results.append(
                     InlineQueryResultArticle(
                         title=result.display_title,
                         input_message_content=InputTextMessageContent(
                             f"/release {result.imdb_id}"
                         ),
-                        description=f"Type: {result.media_type.capitalize()}",
+                        description=description,
+                        thumb_url=result.thumb_url,
+                        thumb_width=200,
+                        thumb_height=300,
                     )
                 )
 
