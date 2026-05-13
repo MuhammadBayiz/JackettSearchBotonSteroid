@@ -452,7 +452,7 @@ class CommandHandlers:
         removed_count = self.auth_service.clear_authorized()
         await self._reply_text(message, f"CLEARED {removed_count} TEMP AUTHORIZATIONS")
 
-    async def listtorrents(self, message: Message):
+    async def listtorrents(self, client, message: Message):
         user_id = message.from_user.id if message.from_user else 0
         chat_id = message.chat.id
         access = self._get_access_decision(user_id, chat_id)
@@ -487,7 +487,7 @@ class CommandHandlers:
         )
         self._list_sessions[session_id]["message_id"] = sent_message.id
         asyncio.create_task(
-            self._listtorrents_loop(session_id, chat_id, sent_message.id)
+            self._listtorrents_loop(client, session_id, chat_id, sent_message.id)
         )
 
     def _build_listtorrents_page(
@@ -557,7 +557,7 @@ class CommandHandlers:
         reply_markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
         return message_text, reply_markup
 
-    async def _listtorrents_loop(self, session_id: str, chat_id: int, message_id: int):
+    async def _listtorrents_loop(self, client, session_id: str, chat_id: int, message_id: int):
         while True:
             await asyncio.sleep(3)
 
@@ -571,7 +571,7 @@ class CommandHandlers:
                     text, reply_markup = self._build_listtorrents_page(
                         session_id, session["page"], torrents, hibernated=True
                     )
-                    await self.app.edit_message_text(
+                    await client.edit_message_text(
                         chat_id=chat_id,
                         message_id=message_id,
                         text=text,
@@ -587,7 +587,7 @@ class CommandHandlers:
                 text, reply_markup = self._build_listtorrents_page(
                     session_id, session["page"], torrents, hibernated=False
                 )
-                await self.app.edit_message_text(
+                await client.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=text,
@@ -638,7 +638,7 @@ class CommandHandlers:
         except Exception:
             await self._answer_callback(callback_query, "ERROR UPDATING PAGE")
 
-    async def list_refresh(self, callback_query: CallbackQuery):
+    async def list_refresh(self, client, callback_query: CallbackQuery):
         data = callback_query.data
         parts = data.split(":")
         if len(parts) != 2:
@@ -675,7 +675,7 @@ class CommandHandlers:
             await self._answer_callback(callback_query, "ERROR REFRESHING")
 
         # Restart loop
-        asyncio.create_task(self._listtorrents_loop(session_id, chat_id, message_id))
+        asyncio.create_task(self._listtorrents_loop(client, session_id, chat_id, message_id))
 
     @staticmethod
     def _total_pages_count(total: int, page_size: int) -> int:

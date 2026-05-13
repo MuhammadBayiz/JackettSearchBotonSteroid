@@ -87,7 +87,7 @@ class JackettSearchBot:
 
         @self.app.on_message(self._filters.command("listtorrents"))
         async def listtorrents_handler(client, message):
-            await self.handlers.listtorrents(message)
+            await self.handlers.listtorrents(client, message)
 
         @self.app.on_callback_query(self._filters.regex(r"^release_page:"))
         async def release_page_handler(client, callback_query):
@@ -107,7 +107,7 @@ class JackettSearchBot:
 
         @self.app.on_callback_query(self._filters.regex(r"^list_refresh:"))
         async def list_refresh_handler(client, callback_query):
-            await self.handlers.list_refresh(callback_query)
+            await self.handlers.list_refresh(client, callback_query)
 
         @self.app.on_inline_query()
         async def inline_query_handler(client, inline_query):
