@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
+from .services.qbittorrent import qBittorrentService
 from .services.tmdb import TMDbService
 from pyrogram.errors import FloodWait
 
@@ -36,12 +37,19 @@ class JackettSearchBot:
         self.tmdb_service = TMDbService(
             tmdb_api_key=self.config.tmdb_api_key,
         )
+        self.qbt_service = qBittorrentService(
+            host=self.config.qbittorrent_host,
+            username=self.config.qbittorrent_username,
+            password=self.config.qbittorrent_password,
+            category=self.config.qbittorrent_category,
+        )
 
         self.handlers = CommandHandlers(
             config=self.config,
             auth_service=self.auth_service,
             jackett_service=self.jackett_service,
             tmdb_service=self.tmdb_service,
+            qbt_service=self.qbt_service,
             logger=self.logger,
         )
 
@@ -77,6 +85,10 @@ class JackettSearchBot:
         async def unauthall_handler(client, message):
             await self.handlers.unauthall(message)
 
+        @self.app.on_message(self._filters.command("listtorrents"))
+        async def listtorrents_handler(client, message):
+            await self.handlers.listtorrents(message)
+
         @self.app.on_callback_query(self._filters.regex(r"^release_page:"))
         async def release_page_handler(client, callback_query):
             await self.handlers.release_page(callback_query)
@@ -84,6 +96,18 @@ class JackettSearchBot:
         @self.app.on_callback_query(self._filters.regex(r"^release_close:"))
         async def release_close_handler(client, callback_query):
             await self.handlers.release_close(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^qbt_add:"))
+        async def qbt_add_handler(client, callback_query):
+            await self.handlers.qbt_add(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^list_page:"))
+        async def list_page_handler(client, callback_query):
+            await self.handlers.list_page(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^list_refresh:"))
+        async def list_refresh_handler(client, callback_query):
+            await self.handlers.list_refresh(callback_query)
 
         @self.app.on_inline_query()
         async def inline_query_handler(client, inline_query):

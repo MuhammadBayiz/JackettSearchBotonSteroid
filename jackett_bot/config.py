@@ -13,6 +13,10 @@ class BotConfig:
     jackett_api_key: str
     jackett_url: str
     tmdb_api_key: str
+    qbittorrent_host: str
+    qbittorrent_username: str
+    qbittorrent_password: str
+    qbittorrent_category: str
     default_max_results: int
     redact_after_seconds: int
     log_file_path: str
@@ -32,6 +36,10 @@ class BotConfig:
                 "JACKETT_API_KEY",
                 "JACKETT_URL",
                 "TMDB_API_KEY",
+                "QBITTORRENT_HOST",
+                "QBITTORRENT_USERNAME",
+                "QBITTORRENT_PASSWORD",
+                "QBITTORRENT_CATEGORY",
                 "OWNER_ID",
             ]
         )
@@ -43,6 +51,10 @@ class BotConfig:
             jackett_api_key=_require_env("JACKETT_API_KEY"),
             jackett_url=_require_env("JACKETT_URL"),
             tmdb_api_key=_require_env("TMDB_API_KEY"),
+            qbittorrent_host=_require_env("QBITTORRENT_HOST"),
+            qbittorrent_username=_require_env("QBITTORRENT_USERNAME"),
+            qbittorrent_password=_require_env("QBITTORRENT_PASSWORD"),
+            qbittorrent_category=_require_env("QBITTORRENT_CATEGORY"),
             default_max_results=_parse_positive_int_env("MAX_RESULTS", default=10),
             redact_after_seconds=_parse_positive_int_env(
                 "REDACT_AFTER_SECONDS", default=300
