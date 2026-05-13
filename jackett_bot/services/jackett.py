@@ -54,7 +54,7 @@ class JackettService:
         )
 
     async def search(
-        self, query: str, golden_popcorn: bool = False, timeout: int = 15
+        self, query: str, golden_popcorn: bool = False, timeout: int = 60
     ) -> list[SearchResult]:
         response = await self._client.get(self.build_search_url(query), timeout=timeout)
         response.raise_for_status()
