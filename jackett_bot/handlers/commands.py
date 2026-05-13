@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import httpx
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -596,6 +596,8 @@ class CommandHandlers:
                 )
             except FloodWait as exc:
                 await asyncio.sleep(exc.value)
+            except MessageNotModified:
+                pass  # The content hasn't changed, no need to log an error
             except Exception as exc:
                 self.logger.warning("Error in listtorrents loop: %s", exc)
 
