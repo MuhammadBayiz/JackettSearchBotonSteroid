@@ -22,13 +22,17 @@ class qBittorrentService:
             self.logger.error("Failed to login to qBittorrent: %s", e)
             raise
 
-    def add_torrent(self, url: str) -> bool:
+    def add_torrent(self, url: str, extra_tags: list[str] | None = None) -> bool:
         self._ensure_authenticated()
         try:
+            tags = ["jackettsearch"]
+            if extra_tags:
+                tags.extend(extra_tags)
+
             return (
                 self.client.torrents_add(
                     urls=url,
-                    tags="jackettsearch",
+                    tags=",".join(tags),
                     category=self.category,
                 )
                 == "Ok."

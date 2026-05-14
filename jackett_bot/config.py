@@ -17,6 +17,11 @@ class BotConfig:
     qbittorrent_username: str
     qbittorrent_password: str
     qbittorrent_category: str
+    webhook_host: str
+    webhook_port: int
+    index_base_url: str
+    media_local_path: str
+    subtitle_languages: list[str]
     default_max_results: int
     redact_after_seconds: int
     log_file_path: str
@@ -55,6 +60,11 @@ class BotConfig:
             qbittorrent_username=_require_env("QBITTORRENT_USERNAME"),
             qbittorrent_password=_require_env("QBITTORRENT_PASSWORD"),
             qbittorrent_category=_require_env("QBITTORRENT_CATEGORY"),
+            webhook_host=_parse_str_env("WEBHOOK_HOST", default="127.0.0.1"),
+            webhook_port=_parse_int_env("WEBHOOK_PORT", default=8888),
+            index_base_url=_parse_str_env("INDEX_BASE_URL", default=""),
+            media_local_path=_parse_str_env("MEDIA_LOCAL_PATH", default=""),
+            subtitle_languages=_parse_str_list_env("SUBTITLE_LANGUAGES", default="eng"),
             default_max_results=_parse_positive_int_env("MAX_RESULTS", default=10),
             redact_after_seconds=_parse_positive_int_env(
                 "REDACT_AFTER_SECONDS", default=300
@@ -131,6 +141,13 @@ def _parse_log_level_env(key: str, default: str) -> int:
             "Use DEBUG, INFO, WARNING, ERROR, or CRITICAL."
         )
     return level
+
+
+def _parse_str_list_env(key: str, default: str) -> list[str]:
+    raw_val = os.getenv(key)
+    if raw_val is None or not raw_val.strip():
+        raw_val = default
+    return [x.strip().lower() for x in raw_val.split(",") if x.strip()]
 
 
 def _parse_authorized_chat_ids(raw_chat_ids: str) -> list[int]:

@@ -4,11 +4,20 @@ import sqlite3
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import aiohttp
+import aiohttp.web
+from aiohttp.web_request import Request
+from aiohttp.web_response import Response
+
 from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
 from .services.qbittorrent import qBittorrentService
 from .services.tmdb import TMDbService
+import json
+import os
+import tempfile
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 try:
@@ -113,8 +122,209 @@ class JackettSearchBot:
         async def inline_query_handler(client, inline_query):
             await self.handlers.inline_query(inline_query)
 
+    async def _extract_and_send_subtitles(self, chat_id: int, content_path: str):
+        if not self.config.subtitle_languages:
+            return
+
+        target_langs = set(self.config.subtitle_languages)
+        video_files = []
+
+        if os.path.isfile(content_path):
+            if content_path.lower().endswith((".mkv", ".mp4")):
+                video_files.append(content_path)
+        elif os.path.isdir(content_path):
+            for root, _, files in os.walk(content_path):
+                for f in files:
+                    if f.lower().endswith((".mkv", ".mp4")):
+                        video_files.append(os.path.join(root, f))
+
+        for video_path in video_files:
+            try:
+                # Run ffprobe to get subtitle streams
+                cmd = [
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "s",
+                    video_path,
+                ]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await proc.communicate()
+
+                if proc.returncode != 0:
+                    self.logger.warning("ffprobe failed on %s", video_path)
+                    continue
+
+                streams_data = json.loads(stdout.decode())
+                streams = streams_data.get("streams", [])
+
+                for stream in streams:
+                    tags = stream.get("tags", {})
+                    lang = tags.get("language", "und").lower()
+
+                    # Convert to 3-letter format if needed (e.g. en -> eng)
+                    if len(lang) == 2:
+                        lang_map = {
+                            "en": "eng",
+                            "es": "spa",
+                            "fr": "fre",
+                            "de": "ger",
+                            "it": "ita",
+                            "ar": "ara",
+                            "ru": "rus",
+                            "zh": "chi",
+                            "ja": "jpn",
+                        }
+                        lang = lang_map.get(lang, lang)
+
+                    if lang in target_langs or "all" in target_langs:
+                        stream_index = stream.get("index")
+                        codec_name = stream.get("codec_name", "")
+
+                        # Prepare output filename
+                        base_name = os.path.splitext(os.path.basename(video_path))[0]
+                        out_filename = f"{base_name}.{lang}.srt"
+
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            out_path = os.path.join(tmpdir, out_filename)
+
+                            # Determine output format based on codec if necessary, but forcing srt usually works for most text sub codecs
+                            ffmpeg_cmd = [
+                                "ffmpeg",
+                                "-y",
+                                "-v",
+                                "quiet",
+                                "-i",
+                                video_path,
+                                "-map",
+                                f"0:{stream_index}",
+                            ]
+
+                            if codec_name == "subrip":
+                                ffmpeg_cmd.extend(["-c:s", "copy"])
+                            else:
+                                ffmpeg_cmd.extend(["-c:s", "srt"])
+
+                            ffmpeg_cmd.append(out_path)
+
+                            extract_proc = await asyncio.create_subprocess_exec(
+                                *ffmpeg_cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await extract_proc.communicate()
+
+                            if extract_proc.returncode == 0 and os.path.exists(
+                                out_path
+                            ):
+                                await self.app.send_document(
+                                    chat_id=chat_id,
+                                    document=out_path,
+                                    caption=f"Extracted Subtitle: {lang.upper()}",
+                                )
+                            else:
+                                self.logger.warning(
+                                    "Failed to extract subtitle %s from %s",
+                                    stream_index,
+                                    video_path,
+                                )
+            except Exception as exc:
+                self.logger.exception(
+                    "Error extracting subtitles from %s: %s", video_path, exc
+                )
+
+    async def handle_torrent_done(self, request: Request) -> Response:
+        try:
+            payload = await request.json()
+            torrent_name = payload.get("name", "Unknown torrent")
+            content_path = payload.get("content_path", "")
+            tags_str = payload.get("tags", "")
+            tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+            chat_id = None
+            for tag in tags:
+                if tag.startswith("jack:"):
+                    try:
+                        chat_id = int(tag[5:])
+                        break
+                    except ValueError:
+                        pass
+
+            if chat_id is not None:
+                text_msg = f"<b>{torrent_name}</b> torrent downloaded."
+
+                # Index URL Mapping
+                if (
+                    content_path
+                    and self.config.index_base_url
+                    and self.config.media_local_path
+                ):
+                    # Strip the media_local_path prefix if it exists
+                    rel_path = content_path
+                    if content_path.startswith(self.config.media_local_path):
+                        rel_path = content_path[len(self.config.media_local_path) :]
+                    rel_path = rel_path.lstrip("/")
+
+                    from urllib.parse import quote
+
+                    # URL encode the parts but keep the slashes
+                    url_parts = [quote(p) for p in rel_path.split("/")]
+                    encoded_rel_path = "/".join(url_parts)
+
+                    base_url = self.config.index_base_url.rstrip("/")
+                    index_url = f"{base_url}/{encoded_rel_path}"
+                    text_msg += f"\n\n<b>Download URL:</b>\n{index_url}"
+
+                await self.app.send_message(
+                    chat_id=chat_id,
+                    text=text_msg,
+                    parse_mode=ParseMode.HTML,
+                )
+
+                if content_path:
+                    asyncio.create_task(
+                        self._extract_and_send_subtitles(chat_id, content_path)
+                    )
+            else:
+                self.logger.warning(
+                    "Torrent done webhook received but no valid chat ID tag found. Tags: %s",
+                    tags,
+                )
+
+            return aiohttp.web.json_response({"status": "ok"})
+        except Exception as exc:
+            self.logger.exception("Failed to process torrent done webhook: %s", exc)
+            return aiohttp.web.json_response(
+                {"status": "error", "message": str(exc)}, status=500
+            )
+
+    async def start_webhook_server(self):
+        app = aiohttp.web.Application()
+        app.router.add_post("/webhook/torrent-done", self.handle_torrent_done)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(
+            runner, self.config.webhook_host, self.config.webhook_port
+        )
+        await site.start()
+        self.logger.info(
+            "Webhook server started on %s:%s",
+            self.config.webhook_host,
+            self.config.webhook_port,
+        )
+
     def run(self):
         self.logger.info("Starting bot runtime.")
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.start_webhook_server())
+
         try:
             self.app.run()
         except KeyboardInterrupt:

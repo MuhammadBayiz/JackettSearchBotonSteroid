@@ -348,7 +348,9 @@ class CommandHandlers:
             )
             await self._answer_callback(callback_query)
 
-            success = self.qbt_service.add_torrent(result.download_url)
+            success = self.qbt_service.add_torrent(
+                result.download_url, extra_tags=[f"jack:{message_chat_id}"]
+            )
             if success:
                 msg = f"torrent {html.escape(torrent_name)} is downloading..."
             else:
@@ -557,7 +559,9 @@ class CommandHandlers:
         reply_markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
         return message_text, reply_markup
 
-    async def _listtorrents_loop(self, client, session_id: str, chat_id: int, message_id: int):
+    async def _listtorrents_loop(
+        self, client, session_id: str, chat_id: int, message_id: int
+    ):
         while True:
             await asyncio.sleep(3)
 
@@ -677,7 +681,9 @@ class CommandHandlers:
             await self._answer_callback(callback_query, "ERROR REFRESHING")
 
         # Restart loop
-        asyncio.create_task(self._listtorrents_loop(client, session_id, chat_id, message_id))
+        asyncio.create_task(
+            self._listtorrents_loop(client, session_id, chat_id, message_id)
+        )
 
     @staticmethod
     def _total_pages_count(total: int, page_size: int) -> int:
