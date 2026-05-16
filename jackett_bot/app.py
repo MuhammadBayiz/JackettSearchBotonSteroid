@@ -241,7 +241,24 @@ class JackettSearchBot:
 
     async def handle_torrent_done(self, request: Request) -> Response:
         try:
-            payload = await request.json()
+            content_type = request.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                try:
+                    payload = await request.json()
+                except Exception:
+                    # Fallback if shell quoting broke the JSON
+                    raw_text = await request.text()
+                    self.logger.warning("Failed to parse JSON cleanly, attempting manual parse. Raw: %s", raw_text)
+                    import ast
+                    try:
+                        # Try to parse python dict string (e.g. {hash: ...} missing quotes)
+                        payload = ast.literal_eval(raw_text)
+                    except Exception:
+                        payload = {}
+            else:
+                # Form data / urlencoded
+                payload = await request.post()
+
             torrent_name = payload.get("name", "Unknown torrent")
             content_path = payload.get("content_path", "")
             tags_str = payload.get("tags", "")

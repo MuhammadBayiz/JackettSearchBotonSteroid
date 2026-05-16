@@ -102,7 +102,7 @@ In qBittorrent:
 3. Enable it and enter the following command (adjust port if needed):
 
 ```bash
-curl -s -X POST "http://localhost:8888/webhook/torrent-done" -H "Content-Type: application/json" -d "{\"hash\":\"%I\",\"name\":\"%N\",\"tags\":\"%G\",\"size\":\"%Z\",\"save_path\":\"%D\",\"content_path\":\"%F\"}"
+curl -s -X POST "http://localhost:8888/webhook/torrent-done" --data-urlencode "name=%N" --data-urlencode "tags=%G" --data-urlencode "content_path=%F"
 ```
 
 ## Bot Commands
