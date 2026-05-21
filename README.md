@@ -8,6 +8,7 @@ Telegram bot for searching Jackett releases with in-chat pagination.
 - `uv` installed (`https://docs.astral.sh/uv/`)
 - A Telegram bot token
 - Jackett running and reachable from this machine
+- `ffmpeg` and `ffprobe` installed on the system (required for subtitle extraction)
 
 ## Setup
 
@@ -46,6 +47,21 @@ JACKETT_URL=http://localhost:9117
 # TMDb Configuration
 TMDB_API_KEY=your_tmdb_api_key_here
 
+# qBittorrent Configuration
+QBITTORRENT_HOST=http://localhost:8080
+QBITTORRENT_USERNAME=admin
+QBITTORRENT_PASSWORD=adminadmin
+QBITTORRENT_CATEGORY=movies
+
+# Webhook Configuration
+WEBHOOK_HOST=127.0.0.1
+WEBHOOK_PORT=8888
+
+# Post-processing Configuration
+INDEX_BASE_URL=https://myindex.com/
+MEDIA_LOCAL_PATH=/downloads/
+SUBTITLE_LANGUAGES=eng,spa
+
 # Authorization
 AUTHORIZED_CHAT_IDS=id1,id2,id3
 OWNER_ID=123456789
@@ -76,9 +92,23 @@ uv run python main.py
 If required config values are missing, startup stops with an initialization error and asks you to fill `config.env` first.
 If Telegram returns a startup flood wait, the bot exits with a clear message and expected wait time.
 
+## qBittorrent Webhook Setup
+
+To enable completion notifications, URL mapping, and subtitle extraction, configure qBittorrent to notify the bot when a torrent finishes.
+
+In qBittorrent:
+1. Go to **Tools > Options > Downloads**.
+2. Scroll down to **Run external program on torrent completion**.
+3. Enable it and enter the following command (adjust port if needed):
+
+```bash
+curl -s -X POST "http://localhost:8888/webhook/torrent-done" --data-urlencode "name=%N" --data-urlencode "tags=%G" --data-urlencode "content_path=%F"
+```
+
 ## Bot Commands
 
 - **Inline Search** : Type `@your_bot_username <query>` to search TMDb. Pressing a result will send `/release <imdb_id>` to the chat to search Jackett for that specific title.
+- `/listtorrents` : View and manage active torrents added by the bot via an interactive auto-updating message.
 - `/release <query>` : Search releases (with inline `PREV`/`NEXT` pagination when results span multiple pages).
 - `/release <query> --gp` : Search only Golden Popcorn releases.
 - `/auth [id]` : Owner-only. Temporarily authorize current chat by default, or an explicit ID (clears on restart).

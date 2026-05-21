@@ -10,6 +10,8 @@ dependencies = [
     "httpx",
     "rich",
     "tgcrypto; python_version < '3.13'",
+    "qbittorrent-api>=2026.5.1",
+    "aiohttp",
 ]
 
 [build-system]
