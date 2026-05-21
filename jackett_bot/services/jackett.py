@@ -222,7 +222,19 @@ def parse_search_results(
         size_raw = _get_item_text(item, "size")
         pub_date = _get_item_text(item, "pubDate")
 
-        if not title or not size_raw or not pub_date:
+        # Prefer magnet url, fallback to standard link
+        magnet_element = item.find(
+            "torznab:attr[@name='magneturl']",
+            namespaces={"torznab": "http://torznab.com/schemas/2015/feed"},
+        )
+        magneturl = (
+            magnet_element.attrib.get("value") if magnet_element is not None else None
+        )
+
+        link = _get_item_text(item, "link")
+        download_url = magneturl or link
+
+        if not title or not size_raw or not pub_date or not download_url:
             continue
         if golden_popcorn and "Golden Popcorn" not in title:
             continue

@@ -22,9 +22,9 @@ from pyrogram.types import (
 from ..config import BotConfig
 from ..services.auth import AuthorizationService
 from ..services.jackett import JackettService, SearchResult, is_id_query
+from ..services.qbittorrent import qBittorrentService
 from ..services.tmdb import TMDbService
 from ..services.settings import SettingsService
-from ..services.qbittorrent import qBittorrentService
 
 
 @dataclass
@@ -88,6 +88,8 @@ class CommandHandlers:
         self._pagination_ttl_seconds = 3600
         self._redaction_delay_seconds = self.config.redact_after_seconds
         self._redaction_tasks: set[asyncio.Task] = set()
+
+        self._list_sessions: dict[str, dict] = {}
 
     async def release(self, message: Message):
         user_id = message.from_user.id if message.from_user else 0
@@ -510,6 +512,94 @@ class CommandHandlers:
             await self._answer_callback(
                 callback_query, "UNABLE TO CLOSE RIGHT NOW", show_alert=False
             )
+
+    async def qbt_add(self, callback_query: CallbackQuery):
+        parsed = self._parse_qbt_add_callback_data(callback_query.data)
+        if not parsed:
+            await self._answer_callback(
+                callback_query, "INVALID ADD REQUEST", show_alert=False
+            )
+            return
+
+        session_id, global_idx = parsed
+        session = self._get_pagination_session(session_id)
+        if not session:
+            await self._answer_callback(
+                callback_query, "SESSION EXPIRED. RUN /RELEASE AGAIN.", show_alert=True
+            )
+            return
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        message_chat_id = (
+            callback_query.message.chat.id if callback_query.message else 0
+        )
+
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
+            await self._answer_callback(
+                callback_query, "YOU CANNOT ADD FROM THIS SESSION", show_alert=True
+            )
+            return
+
+        if message_chat_id != session.chat_id:
+            await self._answer_callback(
+                callback_query, "INVALID CHAT FOR THIS REQUEST", show_alert=True
+            )
+            return
+
+        if not callback_query.message:
+            await self._answer_callback(
+                callback_query, "MESSAGE NO LONGER AVAILABLE", show_alert=True
+            )
+            return
+
+        if global_idx < 0 or global_idx >= len(session.results):
+            await self._answer_callback(
+                callback_query, "RESULT NOT FOUND", show_alert=True
+            )
+            return
+
+        result = session.results[global_idx]
+        torrent_name = result.title
+
+        try:
+            await callback_query.message.edit_text(
+                f"Adding {html.escape(torrent_name)} to qbittorrent...",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+            await self._answer_callback(callback_query)
+
+            success = self.qbt_service.add_torrent(
+                result.download_url, extra_tags=[f"jack:{message_chat_id}"]
+            )
+            if success:
+                msg = f"torrent {html.escape(torrent_name)} is downloading..."
+            else:
+                msg = f"Failed to add {html.escape(torrent_name)} to qbittorrent."
+
+            await callback_query.message.edit_text(
+                msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except FloodWait as exc:
+            self.logger.warning(
+                "FloodWait while adding to qbittorrent | wait_seconds=%s",
+                exc.value,
+            )
+        except Exception as exc:
+            self.logger.exception("Failed to add torrent to qbittorrent: %s", exc)
+            try:
+                await callback_query.message.edit_text(
+                    f"An error occurred adding {html.escape(torrent_name)}.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
 
     async def auth(self, message: Message):
         requester_id = message.from_user.id if message.from_user else 0

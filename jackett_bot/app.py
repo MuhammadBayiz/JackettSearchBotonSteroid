@@ -159,6 +159,8 @@ class JackettSearchBot:
                     if f.lower().endswith((".mkv", ".mp4")):
                         video_files.append(os.path.join(root, f))
 
+        subtitles_extracted = 0
+
         for video_path in video_files:
             try:
                 cmd = [
@@ -180,6 +182,7 @@ class JackettSearchBot:
                 for stream in streams_data.get("streams", []):
                     tags = stream.get("tags", {})
                     lang = tags.get("language", "und").lower()
+                    title = tags.get("title", "")
 
                     if len(lang) == 2:
                         lang_map = {
@@ -194,6 +197,9 @@ class JackettSearchBot:
                         codec_name = stream.get("codec_name", "")
                         base_name = os.path.splitext(os.path.basename(video_path))[0]
                         out_filename = f"{base_name}.{lang}.srt"
+                        caption_text = lang.upper()
+                        if title:
+                            caption_text += f" - {title}"
 
                         with tempfile.TemporaryDirectory() as tmpdir:
                             out_path = os.path.join(tmpdir, out_filename)
@@ -218,8 +224,9 @@ class JackettSearchBot:
                                 await self.app.send_document(
                                     chat_id=chat_id,
                                     document=out_path,
-                                    caption=f"Extracted Subtitle: {lang.upper()}",
+                                    caption=caption_text,
                                 )
+                                subtitles_extracted += 1
                             else:
                                 self.logger.warning(
                                     "Failed to extract subtitle %s from %s",
@@ -230,9 +237,29 @@ class JackettSearchBot:
                     "Error extracting subtitles from %s: %s", video_path, exc
                 )
 
+        if subtitles_extracted == 0:
+            await self.app.send_message(chat_id=chat_id, text="No subtitles found.")
+
     async def handle_torrent_done(self, request: Request) -> Response:
         try:
-            payload = await request.json()
+            content_type = request.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                try:
+                    payload = await request.json()
+                except Exception:
+                    raw_text = await request.text()
+                    self.logger.warning(
+                        "Failed to parse JSON cleanly, attempting manual parse. Raw: %s",
+                        raw_text,
+                    )
+                    import ast
+                    try:
+                        payload = ast.literal_eval(raw_text)
+                    except Exception:
+                        payload = {}
+            else:
+                payload = await request.post()
+
             torrent_name = payload.get("name", "Unknown torrent")
             content_path = payload.get("content_path", "")
             tags_str = payload.get("tags", "")
@@ -271,7 +298,8 @@ class JackettSearchBot:
                     )
             else:
                 self.logger.warning(
-                    "Torrent done webhook: no valid jack: tag found. Tags: %s", tags
+                    "Torrent done webhook received but no valid chat ID tag found. Tags: %s",
+                    tags,
                 )
 
             return aiohttp.web.json_response({"status": "ok"})
