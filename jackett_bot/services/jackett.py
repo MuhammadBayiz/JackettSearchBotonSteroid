@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote
 
@@ -35,17 +35,39 @@ class SearchResult:
         return f"Title: {self.title}\nAge: {self.age}\nSize: {self.size}\n"
 
 
+@dataclass(frozen=True)
+class JackettCategory:
+    name: str
+    id: str
+
+
+def _is_imdb_id(query: str) -> bool:
+    return query.startswith("tt") and query[2:].isdigit()
+
+
+def _is_tmdb_id(query: str) -> bool:
+    return query.startswith("tmdb:") and query[5:].isdigit()
+
+
+def is_id_query(query: str) -> bool:
+    """True when query is an IMDB or TMDB ID — skips category selection."""
+    return _is_imdb_id(query) or _is_tmdb_id(query)
+
+
 class JackettService:
     def __init__(
         self,
         jackett_url: str,
         jackett_api_key: str,
+        jackett_password: str = "",
         client: httpx.AsyncClient | None = None,
     ):
         self.jackett_url = jackett_url.rstrip("/")
         self.jackett_api_key = jackett_api_key
-        self._client = client or httpx.AsyncClient()
+        self.jackett_password = jackett_password
+        self._client = client or httpx.AsyncClient(follow_redirects=True)
         self._owns_client = client is None
+        self._categories_cache: list[JackettCategory] | None = None
 
     def build_search_url(
         self,
@@ -53,15 +75,14 @@ class JackettService:
         category: str | None = None,
         indexer_ids: list[str] | None = None,
     ) -> str:
-        if indexer_ids:
-            indexer_path = ",".join(indexer_ids)
-        else:
-            indexer_path = "all"
-
+        indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
         base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
 
-        if query.startswith("tt") and query[2:].isdigit():
+        if _is_imdb_id(query):
             url = f"{base}?apikey={self.jackett_api_key}&imdbid={query}"
+        elif _is_tmdb_id(query):
+            tmdb_id = query[5:]
+            url = f"{base}?apikey={self.jackett_api_key}&tmdbid={tmdb_id}"
         else:
             url = f"{base}?apikey={self.jackett_api_key}&t=search&q={quote(query)}"
 
@@ -70,21 +91,68 @@ class JackettService:
 
         return url
 
-    async def get_tags_from_api(self, timeout: int = 30) -> dict[str, list[str]]:
-        """Return {tag: [indexer_id, ...]} for all configured indexers that have tags."""
-        url = f"{self.jackett_url}/api/v2.0/indexers?configured=true&apikey={self.jackett_api_key}"
+    async def get_categories(self, timeout: int = 30) -> list[JackettCategory]:
+        """Fetch top-level categories from Jackett caps. Cached after first call."""
+        if self._categories_cache is not None:
+            return self._categories_cache
+
+        url = (
+            f"{self.jackett_url}/api/v2.0/indexers/all/results/torznab/api"
+            f"?apikey={self.jackett_api_key}&t=caps"
+        )
         try:
             response = await self._client.get(url, timeout=timeout)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            cats = [
+                JackettCategory(name=el.get("name", ""), id=el.get("id", ""))
+                for el in root.findall(".//categories/category")
+                if el.get("name") and el.get("id")
+            ]
+        except Exception:
+            cats = []
+
+        self._categories_cache = cats
+        return cats
+
+    async def _get_authenticated_client(self, timeout: int = 30) -> httpx.AsyncClient:
+        """Return a client with a valid Jackett session cookie.
+
+        Jackett's management API requires a browser-style session:
+        1. GET /UI/Login  →  nginx reverse proxy sets TestCookie
+        2. POST /UI/Dashboard with password  →  Jackett sets its own session cookie
+        """
+        auth_client = httpx.AsyncClient(follow_redirects=True)
+        await auth_client.get(f"{self.jackett_url}/UI/Login", timeout=timeout)
+        await auth_client.post(
+            f"{self.jackett_url}/UI/Dashboard",
+            data={"password": self.jackett_password},
+            timeout=timeout,
+        )
+        return auth_client
+
+    async def get_tags_from_api(self, timeout: int = 30) -> dict[str, list[str]]:
+        """Return {tag: [indexer_id, ...]} for all configured indexers that have tags."""
+        auth_client = None
+        try:
+            auth_client = await self._get_authenticated_client(timeout=timeout)
+            response = await auth_client.get(
+                f"{self.jackett_url}/api/v2.0/indexers",
+                params={"configured": "true", "apikey": self.jackett_api_key},
+                timeout=timeout,
+            )
             response.raise_for_status()
             data = response.json()
         except Exception:
             return {}
+        finally:
+            if auth_client is not None:
+                await auth_client.aclose()
 
         tag_map: dict[str, list[str]] = {}
         for indexer in data:
             indexer_id = indexer.get("id", "")
-            tags = indexer.get("tags") or []
-            for tag in tags:
+            for tag in indexer.get("tags") or []:
                 tag_map.setdefault(tag, []).append(indexer_id)
 
         return tag_map
@@ -163,17 +231,14 @@ def parse_search_results(
         if size_bytes is None:
             continue
 
-        link = _get_item_text(item, "link")
-        magnet = _get_torznab_attr(item, "magneturl")
-
         results.append(
             SearchResult(
                 title=title,
                 age=format_pub_date(pub_date),
                 size=convert_size(size_bytes),
                 size_bytes=size_bytes,
-                link=link,
-                magnet=magnet,
+                link=_get_item_text(item, "link"),
+                magnet=_get_torznab_attr(item, "magneturl"),
             )
         )
 

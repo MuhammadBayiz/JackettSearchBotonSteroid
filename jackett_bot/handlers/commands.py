@@ -20,9 +20,9 @@ from pyrogram.types import (
 
 from ..config import BotConfig
 from ..services.auth import AuthorizationService
-from ..services.jackett import JackettService, SearchResult
+from ..services.jackett import JackettService, SearchResult, is_id_query
 from ..services.tmdb import TMDbService
-from ..services.settings import SettingsService, AVAILABLE_CATEGORIES
+from ..services.settings import SettingsService
 
 
 @dataclass
@@ -126,18 +126,23 @@ class CommandHandlers:
         )
         self._search_sessions[session_id] = session
 
-        is_imdb = query.startswith("tt") and query[2:].isdigit()
-
-        if is_imdb:
+        if is_id_query(query):
             await self._show_tag_selection(message, session_id)
         else:
             await self._show_category_selection(message, session_id)
 
     async def _show_category_selection(self, message: Message, session_id: str):
-        active = self.settings_service.get_active_categories()
+        try:
+            categories = await self.jackett_service.get_categories()
+        except Exception as exc:
+            self.logger.warning("Failed to fetch categories: %s", exc)
+            categories = []
+
+        disabled = self.settings_service.get_disabled_categories()
         keyboard = [
-            [InlineKeyboardButton(cat, callback_data=f"release_cat:{session_id}:{cat}")]
-            for cat in active
+            [InlineKeyboardButton(cat.name, callback_data=f"release_cat:{session_id}:{cat.name}")]
+            for cat in categories
+            if cat.name not in disabled
         ]
         keyboard.append(
             [InlineKeyboardButton("All", callback_data=f"release_cat:{session_id}:All")]
@@ -253,7 +258,10 @@ class CommandHandlers:
         try:
             category_id = None
             if search_session.category and search_session.category != "All":
-                category_id = self.settings_service.category_to_id(search_session.category)
+                categories = await self.jackett_service.get_categories()
+                matched = next((c for c in categories if c.name == search_session.category), None)
+                if matched:
+                    category_id = matched.id
 
             indexer_ids = search_session.tag_indexer_ids if search_session.tag != "All" else None
 
@@ -554,10 +562,11 @@ class CommandHandlers:
             await self._reply_text(message, "ONLY OWNER CAN USE /SETTINGS")
             return
 
+        keyboard = await self._build_settings_keyboard()
         await message.reply_text(
             "<b>Bot Settings</b>\nToggle active categories:",
             parse_mode=ParseMode.HTML,
-            reply_markup=self._build_settings_keyboard(),
+            reply_markup=keyboard,
         )
 
     async def settings_toggle(self, callback_query: CallbackQuery):
@@ -568,23 +577,28 @@ class CommandHandlers:
             )
 
         parts = callback_query.data.split(":")
-        if len(parts) == 2 and parts[1] in AVAILABLE_CATEGORIES:
+        if len(parts) == 2:
             self.settings_service.toggle_category(parts[1])
 
         try:
-            await callback_query.message.edit_reply_markup(self._build_settings_keyboard())
+            keyboard = await self._build_settings_keyboard()
+            await callback_query.message.edit_reply_markup(keyboard)
             await self._answer_callback(callback_query)
         except Exception as exc:
             self.logger.warning("Failed to update settings message: %s", exc)
             await self._answer_callback(callback_query)
 
-    def _build_settings_keyboard(self) -> InlineKeyboardMarkup:
+    async def _build_settings_keyboard(self) -> InlineKeyboardMarkup:
+        try:
+            categories = await self.jackett_service.get_categories()
+        except Exception:
+            categories = []
         disabled = self.settings_service.get_disabled_categories()
         keyboard = []
-        for cat in AVAILABLE_CATEGORIES:
-            status = "❌" if cat in disabled else "✅"
+        for cat in categories:
+            status = "❌" if cat.name in disabled else "✅"
             keyboard.append(
-                [InlineKeyboardButton(f"{status} {cat}", callback_data=f"settings_toggle:{cat}")]
+                [InlineKeyboardButton(f"{status} {cat.name}", callback_data=f"settings_toggle:{cat.name}")]
             )
         return InlineKeyboardMarkup(keyboard)
 
@@ -601,8 +615,7 @@ class CommandHandlers:
 
             inline_results = []
             for result in results:
-                if not result.imdb_id:
-                    continue
+                release_arg = result.imdb_id if result.imdb_id else f"tmdb:{result.id}"
 
                 lang = (result.original_language or "").upper()
                 media_label = result.media_type.capitalize()
@@ -616,7 +629,7 @@ class CommandHandlers:
                     InlineQueryResultArticle(
                         title=result.display_title,
                         input_message_content=InputTextMessageContent(
-                            f"/release {result.imdb_id}"
+                            f"/release {release_arg}"
                         ),
                         description=description,
                         thumb_url=result.thumb_url,
@@ -852,17 +865,18 @@ class CommandHandlers:
         message_text = header + body
         keyboard_rows: list[list[InlineKeyboardButton]] = []
 
+        dl_buttons: list[InlineKeyboardButton] = []
         for i, result in enumerate(page_results):
             global_index = start_index + i
             if result.download_url():
-                keyboard_rows.append(
-                    [
-                        InlineKeyboardButton(
-                            f"DL {global_index + 1}",
-                            callback_data=f"release_dl:{session.session_id}:{global_index}",
-                        )
-                    ]
+                dl_buttons.append(
+                    InlineKeyboardButton(
+                        f"DL {global_index + 1}",
+                        callback_data=f"release_dl:{session.session_id}:{global_index}",
+                    )
                 )
+        for i in range(0, len(dl_buttons), 5):
+            keyboard_rows.append(dl_buttons[i : i + 5])
 
         nav_buttons: list[InlineKeyboardButton] = []
         if total_pages > 1 and page > 1:

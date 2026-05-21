@@ -79,12 +79,9 @@ class TMDbService:
         results.sort(key=lambda r: r.popularity, reverse=True)
         results = results[:limit]
 
-        # Fetch imdb_id concurrently
+        # Fetch imdb_id concurrently (falls back to tmdb:{id} in the bot if unavailable)
         tasks = [self._fetch_imdb_id(result) for result in results]
-        results_with_imdb_id = await asyncio.gather(*tasks)
-
-        # Filter out results without imdb_id as they can't be searched using it in jackett easily
-        return [r for r in results_with_imdb_id if r.imdb_id]
+        return list(await asyncio.gather(*tasks))
 
     async def _fetch_imdb_id(self, result: TMDbSearchResult) -> TMDbSearchResult:
         url = f"{self.base_url}/{result.media_type}/{result.id}/external_ids"

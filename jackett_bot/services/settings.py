@@ -5,29 +5,6 @@ import logging
 import os
 
 
-AVAILABLE_CATEGORIES = [
-    "Movies",
-    "TV",
-    "XXX",
-    "Audio",
-    "Books",
-    "PC",
-    "Console",
-    "Others",
-]
-
-CATEGORY_ID_MAP = {
-    "Movies": "2000",
-    "TV": "5000",
-    "XXX": "6000",
-    "Audio": "3000",
-    "Books": "7000",
-    "PC": "4000",
-    "Console": "1000",
-    "Others": "8000",
-}
-
-
 class SettingsService:
     def __init__(self, settings_file: str = "settings.json"):
         self.settings_file = settings_file
@@ -54,18 +31,14 @@ class SettingsService:
     def get_disabled_categories(self) -> list[str]:
         return self._data.get("disabled_categories", [])
 
-    def toggle_category(self, category: str) -> None:
+    def toggle_category(self, category_name: str) -> None:
         disabled = self.get_disabled_categories()
-        if category in disabled:
-            disabled.remove(category)
+        if category_name in disabled:
+            disabled.remove(category_name)
         else:
-            disabled.append(category)
+            disabled.append(category_name)
         self._data["disabled_categories"] = disabled
         self._save()
 
-    def get_active_categories(self) -> list[str]:
-        disabled = self.get_disabled_categories()
-        return [c for c in AVAILABLE_CATEGORIES if c not in disabled]
-
-    def category_to_id(self, category: str) -> str | None:
-        return CATEGORY_ID_MAP.get(category)
+    def is_category_enabled(self, category_name: str) -> bool:
+        return category_name not in self.get_disabled_categories()

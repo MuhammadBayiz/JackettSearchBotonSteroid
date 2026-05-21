@@ -12,6 +12,7 @@ class BotConfig:
     api_hash: str
     jackett_api_key: str
     jackett_url: str
+    jackett_password: str
     tmdb_api_key: str
     default_max_results: int
     redact_after_seconds: int
@@ -42,6 +43,7 @@ class BotConfig:
             api_hash=_require_env("API_HASH"),
             jackett_api_key=_require_env("JACKETT_API_KEY"),
             jackett_url=_require_env("JACKETT_URL"),
+            jackett_password=_parse_str_env("JACKETT_PASSWORD", default=""),
             tmdb_api_key=_require_env("TMDB_API_KEY"),
             default_max_results=_parse_positive_int_env("MAX_RESULTS", default=10),
             redact_after_seconds=_parse_positive_int_env(
