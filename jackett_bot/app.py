@@ -138,6 +138,8 @@ class JackettSearchBot:
                     if f.lower().endswith((".mkv", ".mp4")):
                         video_files.append(os.path.join(root, f))
 
+        subtitles_extracted = 0
+
         for video_path in video_files:
             try:
                 # Run ffprobe to get subtitle streams
@@ -228,6 +230,7 @@ class JackettSearchBot:
                                     document=out_path,
                                     caption=f"Extracted Subtitle: {lang.upper()}",
                                 )
+                                subtitles_extracted += 1
                             else:
                                 self.logger.warning(
                                     "Failed to extract subtitle %s from %s",
@@ -239,6 +242,9 @@ class JackettSearchBot:
                     "Error extracting subtitles from %s: %s", video_path, exc
                 )
 
+        if subtitles_extracted == 0:
+            await self.app.send_message(chat_id=chat_id, text="No subtitles found.")
+
     async def handle_torrent_done(self, request: Request) -> Response:
         try:
             content_type = request.headers.get("Content-Type", "")
@@ -248,8 +254,12 @@ class JackettSearchBot:
                 except Exception:
                     # Fallback if shell quoting broke the JSON
                     raw_text = await request.text()
-                    self.logger.warning("Failed to parse JSON cleanly, attempting manual parse. Raw: %s", raw_text)
+                    self.logger.warning(
+                        "Failed to parse JSON cleanly, attempting manual parse. Raw: %s",
+                        raw_text,
+                    )
                     import ast
+
                     try:
                         # Try to parse python dict string (e.g. {hash: ...} missing quotes)
                         payload = ast.literal_eval(raw_text)
