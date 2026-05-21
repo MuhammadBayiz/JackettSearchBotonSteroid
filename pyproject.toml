@@ -11,6 +11,7 @@ dependencies = [
     "rich",
     "tgcrypto; python_version < '3.13'",
     "qbittorrent-api>=2026.5.1",
+    "aiohttp>=3.13.5",
 ]
 
 [build-system]

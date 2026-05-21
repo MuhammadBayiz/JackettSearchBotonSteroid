@@ -1,13 +1,14 @@
 import asyncio
 import html
 import logging
+import math
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -71,7 +72,7 @@ class CommandHandlers:
         jackett_service: JackettService,
         tmdb_service: TMDbService,
         settings_service: SettingsService,
-        qbittorrent_service: qBittorrentService,
+        qbt_service: qBittorrentService,
         logger: logging.Logger,
     ):
         self.config = config
@@ -79,10 +80,11 @@ class CommandHandlers:
         self.jackett_service = jackett_service
         self.tmdb_service = tmdb_service
         self.settings_service = settings_service
-        self.qbittorrent_service = qbittorrent_service
+        self.qbt_service = qbt_service
         self.logger = logger
         self._pagination_sessions: dict[str, ReleasePaginationSession] = {}
         self._search_sessions: dict[str, ReleaseSearchSession] = {}
+        self._list_sessions: dict[str, dict] = {}
         self._pagination_ttl_seconds = 3600
         self._redaction_delay_seconds = self.config.redact_after_seconds
         self._redaction_tasks: set[asyncio.Task] = set()
@@ -416,7 +418,10 @@ class CommandHandlers:
         await self._answer_callback(callback_query, "ADDING TO QBITTORRENT...")
         try:
             success = await asyncio.get_event_loop().run_in_executor(
-                None, self.qbittorrent_service.add_torrent, url
+                None,
+                lambda: self.qbt_service.add_torrent(
+                    url, extra_tags=[f"jack:{session.chat_id}"]
+                ),
             )
         except Exception as exc:
             self.logger.error("Failed to add torrent to qBittorrent: %s", exc)
@@ -628,6 +633,237 @@ class CommandHandlers:
                 [InlineKeyboardButton(f"{status} {cat.name}", callback_data=f"settings_toggle:{cat.name}")]
             )
         return InlineKeyboardMarkup(keyboard)
+
+    async def listtorrents(self, client, message: Message):
+        user_id = message.from_user.id if message.from_user else 0
+        chat_id = message.chat.id
+        access = self._get_access_decision(user_id, chat_id)
+
+        if not access.allowed:
+            await self._reply_text(message, f"NOT AUTHORIZED ({access.reason})")
+            return
+
+        try:
+            torrents = self.qbt_service.get_torrents()
+            if not torrents:
+                await self._reply_text(message, "NO TORRENTS ADDED YET")
+                return
+        except Exception as exc:
+            self.logger.exception("Failed to get torrents: %s", exc)
+            await self._reply_text(message, "FAILED TO GET TORRENTS")
+            return
+
+        session_id = uuid.uuid4().hex[:12]
+        self._list_sessions[session_id] = {
+            "page": 1,
+            "last_interaction": time.time(),
+            "chat_id": chat_id,
+            "user_id": user_id,
+        }
+
+        text, reply_markup = self._build_listtorrents_page(
+            session_id, 1, torrents, hibernated=False
+        )
+        sent_message = await message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+        self._list_sessions[session_id]["message_id"] = sent_message.id
+        asyncio.create_task(
+            self._listtorrents_loop(client, session_id, chat_id, sent_message.id)
+        )
+
+    def _build_listtorrents_page(
+        self, session_id: str, page: int, torrents: list, hibernated: bool = False
+    ):
+        page_size = 5
+        total_pages = self._total_pages_count(len(torrents), page_size)
+        page = self._normalize_page(page, total_pages)
+
+        start_index = (page - 1) * page_size
+        end_index = start_index + page_size
+        page_torrents = torrents[start_index:end_index]
+
+        header = "<b><u>TORRENTS LIST</u></b>\n"
+        if hibernated:
+            header += "<i>(Hibernating)</i>\n"
+        header += (
+            f"<b>Page:</b> {page}/{total_pages} | <b>Total:</b> {len(torrents)}\n\n"
+        )
+
+        body = ""
+        for t in page_torrents:
+            name = html.escape(t.name)
+            state = t.state
+            progress = round(t.progress * 100, 1)
+            size = self._convert_size(t.total_size)
+            speed = f"{self._convert_size(t.dlspeed)}/s" if t.dlspeed > 0 else "0 B/s"
+            eta = f"{t.eta}s" if t.eta < 8640000 else "∞"
+            seeds = t.num_seeds
+            leechs = t.num_leechs
+
+            body += (
+                f"<b>{name}</b>\n"
+                f"State: {state} | Progress: {progress}%\n"
+                f"Size: {size} | Speed: {speed} | ETA: {eta}\n"
+                f"Seeds: {seeds} | Leechers: {leechs}\n\n"
+            )
+
+        message_text = header + body
+
+        keyboard_rows = []
+        if hibernated:
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "Refresh", callback_data=f"list_refresh:{session_id}"
+                    )
+                ]
+            )
+        else:
+            nav_buttons = []
+            if total_pages > 1 and page > 1:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        "PREV", callback_data=f"list_page:{session_id}:{page - 1}"
+                    )
+                )
+            if total_pages > 1 and page < total_pages:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        "NEXT", callback_data=f"list_page:{session_id}:{page + 1}"
+                    )
+                )
+            if nav_buttons:
+                keyboard_rows.append(nav_buttons)
+
+        reply_markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
+        return message_text, reply_markup
+
+    async def _listtorrents_loop(
+        self, client, session_id: str, chat_id: int, message_id: int
+    ):
+        while True:
+            await asyncio.sleep(3)
+
+            session = self._list_sessions.get(session_id)
+            if not session:
+                break
+
+            if time.time() - session["last_interaction"] > 30:
+                try:
+                    torrents = self.qbt_service.get_torrents()
+                    text, reply_markup = self._build_listtorrents_page(
+                        session_id, session["page"], torrents, hibernated=True
+                    )
+                    await client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup,
+                    )
+                except Exception:
+                    pass
+                break  # exit loop after hibernating
+
+            try:
+                torrents = self.qbt_service.get_torrents()
+                text, reply_markup = self._build_listtorrents_page(
+                    session_id, session["page"], torrents, hibernated=False
+                )
+                await client.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                )
+            except FloodWait as exc:
+                await asyncio.sleep(exc.value)
+            except MessageNotModified:
+                pass  # The content hasn't changed, no need to log an error
+            except Exception as exc:
+                self.logger.warning("Error in listtorrents loop: %s", exc)
+
+    async def list_page(self, callback_query: CallbackQuery):
+        data = callback_query.data
+        parts = data.split(":")
+        if len(parts) != 3:
+            return await self._answer_callback(callback_query, "INVALID CALLBACK")
+
+        session_id = parts[1]
+        try:
+            page = int(parts[2])
+        except ValueError:
+            return await self._answer_callback(callback_query, "INVALID PAGE")
+
+        session = self._list_sessions.get(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if requester_id != session["user_id"] and requester_id != self.config.owner_id:
+            return await self._answer_callback(
+                callback_query, "NOT YOUR SESSION", show_alert=True
+            )
+
+        session["page"] = page
+        session["last_interaction"] = time.time()
+
+        try:
+            torrents = self.qbt_service.get_torrents()
+            text, reply_markup = self._build_listtorrents_page(
+                session_id, page, torrents, hibernated=False
+            )
+            await callback_query.message.edit_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+            )
+            await self._answer_callback(callback_query)
+        except Exception:
+            await self._answer_callback(callback_query, "ERROR UPDATING PAGE")
+
+    async def list_refresh(self, client, callback_query: CallbackQuery):
+        data = callback_query.data
+        parts = data.split(":")
+        if len(parts) != 2:
+            return await self._answer_callback(callback_query, "INVALID CALLBACK")
+
+        session_id = parts[1]
+        session = self._list_sessions.get(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if requester_id != session["user_id"] and requester_id != self.config.owner_id:
+            return await self._answer_callback(
+                callback_query, "NOT YOUR SESSION", show_alert=True
+            )
+
+        session["last_interaction"] = time.time()
+
+        chat_id = callback_query.message.chat.id
+        message_id = callback_query.message.id
+
+        try:
+            torrents = self.qbt_service.get_torrents()
+            text, reply_markup = self._build_listtorrents_page(
+                session_id, session["page"], torrents, hibernated=False
+            )
+            await callback_query.message.edit_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+            )
+            await self._answer_callback(callback_query)
+        except Exception:
+            await self._answer_callback(callback_query, "ERROR REFRESHING")
+
+        # Restart loop
+        asyncio.create_task(
+            self._listtorrents_loop(client, session_id, chat_id, message_id)
+        )
 
     async def inline_query(self, inline_query: InlineQuery):
         # Inline queries are allowed for everyone — authorization checked when the
@@ -991,3 +1227,17 @@ class CommandHandlers:
         except ValueError:
             return None
         return session_id, page
+
+    @staticmethod
+    def _total_pages_count(total: int, page_size: int) -> int:
+        return max(1, math.ceil(total / page_size))
+
+    @staticmethod
+    def _convert_size(size_bytes: int) -> str:
+        if size_bytes == 0:
+            return "0 B"
+        size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+        index = int(math.floor(math.log(size_bytes, 1024)))
+        power = math.pow(1024, index)
+        size = round(size_bytes / power, 2)
+        return f"{size} {size_name[index]}"
