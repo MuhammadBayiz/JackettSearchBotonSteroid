@@ -68,6 +68,45 @@ class JackettService:
         self._client = client or httpx.AsyncClient(follow_redirects=True)
         self._owns_client = client is None
         self._categories_cache: list[JackettCategory] | None = None
+        self._indexer_caps_cache: dict[str, set[str]] = {}
+
+    async def get_indexer_supported_params(
+        self, indexer_id: str, timeout: int = 30
+    ) -> set[str]:
+        """Return the set of supported search params for an indexer (cached)."""
+        if indexer_id in self._indexer_caps_cache:
+            return self._indexer_caps_cache[indexer_id]
+
+        url = (
+            f"{self.jackett_url}/api/v2.0/indexers/{indexer_id}/results/torznab/api"
+            f"?apikey={self.jackett_api_key}&t=caps"
+        )
+        try:
+            response = await self._client.get(url, timeout=timeout)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            params: set[str] = set()
+            for el in root.findall(".//searching/*"):
+                if el.get("available") == "yes":
+                    for p in el.get("supportedParams", "").split(","):
+                        p = p.strip()
+                        if p:
+                            params.add(p)
+        except Exception:
+            params = set()
+
+        self._indexer_caps_cache[indexer_id] = params
+        return params
+
+    async def all_indexers_support_param(
+        self, indexer_ids: list[str], param: str, timeout: int = 30
+    ) -> bool:
+        """Return True only if every indexer in the list supports the given param."""
+        for indexer_id in indexer_ids:
+            supported = await self.get_indexer_supported_params(indexer_id, timeout=timeout)
+            if param not in supported:
+                return False
+        return True
 
     def build_search_url(
         self,
@@ -166,15 +205,14 @@ class JackettService:
         indexer_ids: list[str] | None = None,
         timeout: int = 60,
     ) -> list[SearchResult]:
-        url = self.build_search_url(query, category=category, indexer_ids=indexer_ids)
+        force_text = False
+        if indexer_ids and is_id_query(query):
+            id_param = "imdbid" if _is_imdb_id(query) else "tmdbid"
+            if not await self.all_indexers_support_param(indexer_ids, id_param):
+                force_text = True
+
+        url = self.build_search_url(query, category=category, indexer_ids=indexer_ids, force_text=force_text)
         response = await self._client.get(url, timeout=timeout)
-
-        # Some indexers don't support ID-based lookup (imdbid/tmdbid), causing a 500.
-        # Retry the same indexers using plain text search instead of dropping tag filtering.
-        if response.status_code == 500 and indexer_ids and is_id_query(query):
-            url = self.build_search_url(query, category=category, indexer_ids=indexer_ids, force_text=True)
-            response = await self._client.get(url, timeout=timeout)
-
         response.raise_for_status()
 
         if not response.text.strip():
