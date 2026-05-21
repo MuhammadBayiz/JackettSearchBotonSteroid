@@ -75,7 +75,12 @@ class JackettService:
         category: str | None = None,
         indexer_ids: list[str] | None = None,
     ) -> str:
-        indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
+        # ID-based searches use Jackett's lookup API which not all indexers support.
+        # Using specific indexers causes a 500 if any of them don't support it.
+        if _is_imdb_id(query) or _is_tmdb_id(query):
+            indexer_path = "all"
+        else:
+            indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
         base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
 
         if _is_imdb_id(query):
