@@ -142,11 +142,12 @@ class CommandHandlers:
             categories = []
 
         disabled = self.settings_service.get_disabled_categories()
-        keyboard = [
-            [InlineKeyboardButton(cat.name, callback_data=f"release_cat:{session_id}:{cat.name}")]
-            for cat in categories
-            if cat.name not in disabled
+        active = [cat for cat in categories if cat.name not in disabled]
+        cat_buttons = [
+            InlineKeyboardButton(cat.name, callback_data=f"release_cat:{session_id}:{cat.name}")
+            for cat in active
         ]
+        keyboard = [cat_buttons[i : i + 3] for i in range(0, len(cat_buttons), 3)]
         keyboard.append(
             [InlineKeyboardButton("All", callback_data=f"release_cat:{session_id}:All")]
         )
@@ -200,11 +201,11 @@ class CommandHandlers:
         if session is not None:
             session.tag_indexer_ids = None
 
-        keyboard = []
-        for tag in sorted(tag_map.keys()):
-            keyboard.append(
-                [InlineKeyboardButton(tag, callback_data=f"release_tag:{session_id}:{tag}")]
-            )
+        tag_buttons = [
+            InlineKeyboardButton(tag, callback_data=f"release_tag:{session_id}:{tag}")
+            for tag in sorted(tag_map.keys())
+        ]
+        keyboard = [tag_buttons[i : i + 3] for i in range(0, len(tag_buttons), 3)]
         keyboard.append(
             [InlineKeyboardButton("All", callback_data=f"release_tag:{session_id}:All")]
         )
@@ -417,22 +418,33 @@ class CommandHandlers:
             success = await asyncio.get_event_loop().run_in_executor(
                 None, self.qbittorrent_service.add_torrent, url
             )
-            if success:
-                await callback_query.message.reply_text(
-                    self._format_reply_text(f"ADDED: {result.title}"),
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await callback_query.message.reply_text(
-                    self._format_reply_text("QBITTORRENT REJECTED THE TORRENT"),
-                    parse_mode=ParseMode.HTML,
-                )
         except Exception as exc:
             self.logger.error("Failed to add torrent to qBittorrent: %s", exc)
-            await callback_query.message.reply_text(
-                self._format_reply_text(f"QBITTORRENT ERROR: {exc}"),
+            success = None
+            error_msg = str(exc)
+
+        msg = callback_query.message
+        if msg is None:
+            return
+
+        try:
+            current_text = msg.text or ""
+            if success:
+                appended = f"\n\n✅ <b>ADDED TO QBITTORRENT:</b>\n<code>{html.escape(result.title)}</code>"
+            elif success is False:
+                appended = f"\n\n❌ <b>QBITTORRENT REJECTED:</b>\n<code>{html.escape(result.title)}</code>"
+            else:
+                appended = f"\n\n❌ <b>QBITTORRENT ERROR:</b>\n<code>{html.escape(error_msg)}</code>"
+
+            await msg.edit_text(
+                current_text + appended,
                 parse_mode=ParseMode.HTML,
+                reply_markup=msg.reply_markup,
             )
+        except FloodWait as exc:
+            self.logger.warning("FloodWait editing results after DL | %s", exc.value)
+        except Exception as exc:
+            self.logger.warning("Could not edit results message after DL: %s", exc)
 
     async def release_close(self, callback_query: CallbackQuery):
         session_id = self._parse_close_callback_data(callback_query.data)
@@ -886,12 +898,12 @@ class CommandHandlers:
             if result.download_url():
                 dl_buttons.append(
                     InlineKeyboardButton(
-                        f"DL {global_index + 1}",
+                        f"⬇️ {global_index + 1}",
                         callback_data=f"release_dl:{session.session_id}:{global_index}",
                     )
                 )
-        for i in range(0, len(dl_buttons), 5):
-            keyboard_rows.append(dl_buttons[i : i + 5])
+        for i in range(0, len(dl_buttons), 3):
+            keyboard_rows.append(dl_buttons[i : i + 3])
 
         nav_buttons: list[InlineKeyboardButton] = []
         if total_pages > 1 and page > 1:
