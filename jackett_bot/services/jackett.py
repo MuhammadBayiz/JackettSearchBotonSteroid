@@ -74,13 +74,14 @@ class JackettService:
         query: str,
         category: str | None = None,
         indexer_ids: list[str] | None = None,
+        force_text: bool = False,
     ) -> str:
         indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
         base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
 
-        if _is_imdb_id(query):
+        if not force_text and _is_imdb_id(query):
             url = f"{base}?apikey={self.jackett_api_key}&imdbid={query}"
-        elif _is_tmdb_id(query):
+        elif not force_text and _is_tmdb_id(query):
             tmdb_id = query[5:]
             url = f"{base}?apikey={self.jackett_api_key}&tmdbid={tmdb_id}"
         else:
@@ -168,10 +169,10 @@ class JackettService:
         url = self.build_search_url(query, category=category, indexer_ids=indexer_ids)
         response = await self._client.get(url, timeout=timeout)
 
-        # Some indexers don't support ID-based lookup (imdbid/tmdbid), causing a 500
-        # when they're targeted directly. Retry with all indexers in that case.
+        # Some indexers don't support ID-based lookup (imdbid/tmdbid), causing a 500.
+        # Retry the same indexers using plain text search instead of dropping tag filtering.
         if response.status_code == 500 and indexer_ids and is_id_query(query):
-            url = self.build_search_url(query, category=category, indexer_ids=None)
+            url = self.build_search_url(query, category=category, indexer_ids=indexer_ids, force_text=True)
             response = await self._client.get(url, timeout=timeout)
 
         response.raise_for_status()
