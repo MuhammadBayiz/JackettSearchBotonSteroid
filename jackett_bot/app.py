@@ -169,6 +169,7 @@ class JackettSearchBot:
                 for stream in streams:
                     tags = stream.get("tags", {})
                     lang = tags.get("language", "und").lower()
+                    title = tags.get("title", "")
 
                     # Convert to 3-letter format if needed (e.g. en -> eng)
                     if len(lang) == 2:
@@ -192,6 +193,10 @@ class JackettSearchBot:
                         # Prepare output filename
                         base_name = os.path.splitext(os.path.basename(video_path))[0]
                         out_filename = f"{base_name}.{lang}.srt"
+
+                        caption_text = lang.upper()
+                        if title:
+                            caption_text += f" - {title}"
 
                         with tempfile.TemporaryDirectory() as tmpdir:
                             out_path = os.path.join(tmpdir, out_filename)
@@ -228,7 +233,7 @@ class JackettSearchBot:
                                 await self.app.send_document(
                                     chat_id=chat_id,
                                     document=out_path,
-                                    caption=f"Extracted Subtitle: {lang.upper()}",
+                                    caption=caption_text,
                                 )
                                 subtitles_extracted += 1
                             else:
