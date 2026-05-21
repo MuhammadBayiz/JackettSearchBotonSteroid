@@ -75,12 +75,7 @@ class JackettService:
         category: str | None = None,
         indexer_ids: list[str] | None = None,
     ) -> str:
-        # ID-based searches use Jackett's lookup API which not all indexers support.
-        # Using specific indexers causes a 500 if any of them don't support it.
-        if _is_imdb_id(query) or _is_tmdb_id(query):
-            indexer_path = "all"
-        else:
-            indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
+        indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
         base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
 
         if _is_imdb_id(query):
@@ -172,6 +167,13 @@ class JackettService:
     ) -> list[SearchResult]:
         url = self.build_search_url(query, category=category, indexer_ids=indexer_ids)
         response = await self._client.get(url, timeout=timeout)
+
+        # Some indexers don't support ID-based lookup (imdbid/tmdbid), causing a 500
+        # when they're targeted directly. Retry with all indexers in that case.
+        if response.status_code == 500 and indexer_ids and is_id_query(query):
+            url = self.build_search_url(query, category=category, indexer_ids=None)
+            response = await self._client.get(url, timeout=timeout)
+
         response.raise_for_status()
 
         if not response.text.strip():
