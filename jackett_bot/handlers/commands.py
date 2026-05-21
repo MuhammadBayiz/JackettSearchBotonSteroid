@@ -23,6 +23,7 @@ from ..services.auth import AuthorizationService
 from ..services.jackett import JackettService, SearchResult, is_id_query
 from ..services.tmdb import TMDbService
 from ..services.settings import SettingsService
+from ..services.qbittorrent import qBittorrentService
 
 
 @dataclass
@@ -70,6 +71,7 @@ class CommandHandlers:
         jackett_service: JackettService,
         tmdb_service: TMDbService,
         settings_service: SettingsService,
+        qbittorrent_service: qBittorrentService,
         logger: logging.Logger,
     ):
         self.config = config
@@ -77,6 +79,7 @@ class CommandHandlers:
         self.jackett_service = jackett_service
         self.tmdb_service = tmdb_service
         self.settings_service = settings_service
+        self.qbittorrent_service = qbittorrent_service
         self.logger = logger
         self._pagination_sessions: dict[str, ReleasePaginationSession] = {}
         self._search_sessions: dict[str, ReleaseSearchSession] = {}
@@ -409,15 +412,27 @@ class CommandHandlers:
                 callback_query, "NO DOWNLOAD LINK AVAILABLE", show_alert=True
             )
 
+        await self._answer_callback(callback_query, "ADDING TO QBITTORRENT...")
         try:
+            success = await asyncio.get_event_loop().run_in_executor(
+                None, self.qbittorrent_service.add_torrent, url
+            )
+            if success:
+                await callback_query.message.reply_text(
+                    self._format_reply_text(f"ADDED: {result.title}"),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await callback_query.message.reply_text(
+                    self._format_reply_text("QBITTORRENT REJECTED THE TORRENT"),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as exc:
+            self.logger.error("Failed to add torrent to qBittorrent: %s", exc)
             await callback_query.message.reply_text(
-                f"<b>{html.escape(result.title)}</b>\n\n<code>{html.escape(url)}</code>",
+                self._format_reply_text(f"QBITTORRENT ERROR: {exc}"),
                 parse_mode=ParseMode.HTML,
             )
-            await self._answer_callback(callback_query)
-        except FloodWait as exc:
-            self.logger.warning("FloodWait sending download link | %s", exc.value)
-            await self._answer_callback(callback_query, "RATE LIMITED. TRY AGAIN LATER.")
 
     async def release_close(self, callback_query: CallbackQuery):
         session_id = self._parse_close_callback_data(callback_query.data)

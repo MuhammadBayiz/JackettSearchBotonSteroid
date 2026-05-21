@@ -9,6 +9,7 @@ from .services.auth import AuthorizationService
 from .services.jackett import JackettService
 from .services.tmdb import TMDbService
 from .services.settings import SettingsService
+from .services.qbittorrent import qBittorrentService
 from pyrogram.errors import FloodWait
 
 try:
@@ -28,12 +29,19 @@ class JackettSearchBot:
         self._filters = filters
 
         self.settings_service = SettingsService()
+        self.qbittorrent_service = qBittorrentService(
+            host=self.config.qbittorrent_host,
+            username=self.config.qbittorrent_username,
+            password=self.config.qbittorrent_password,
+            category=self.config.qbittorrent_category,
+        )
         self.auth_service = AuthorizationService(
             bootstrap_ids=self.config.authorized_chat_ids,
         )
         self.jackett_service = JackettService(
             jackett_url=self.config.jackett_url,
             jackett_api_key=self.config.jackett_api_key,
+            jackett_password=self.config.jackett_password,
         )
         self.tmdb_service = TMDbService(
             tmdb_api_key=self.config.tmdb_api_key,
@@ -45,6 +53,7 @@ class JackettSearchBot:
             jackett_service=self.jackett_service,
             tmdb_service=self.tmdb_service,
             settings_service=self.settings_service,
+            qbittorrent_service=self.qbittorrent_service,
             logger=self.logger,
         )
 
