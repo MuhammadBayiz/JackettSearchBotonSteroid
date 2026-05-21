@@ -12,6 +12,7 @@ class BotConfig:
     api_hash: str
     jackett_api_key: str
     jackett_url: str
+    jackett_password: str
     tmdb_api_key: str
     qbittorrent_host: str
     qbittorrent_username: str
@@ -44,7 +45,6 @@ class BotConfig:
                 "QBITTORRENT_HOST",
                 "QBITTORRENT_USERNAME",
                 "QBITTORRENT_PASSWORD",
-                "QBITTORRENT_CATEGORY",
                 "OWNER_ID",
             ]
         )
@@ -55,11 +55,12 @@ class BotConfig:
             api_hash=_require_env("API_HASH"),
             jackett_api_key=_require_env("JACKETT_API_KEY"),
             jackett_url=_require_env("JACKETT_URL"),
+            jackett_password=_parse_str_env("JACKETT_PASSWORD", default=""),
             tmdb_api_key=_require_env("TMDB_API_KEY"),
             qbittorrent_host=_require_env("QBITTORRENT_HOST"),
             qbittorrent_username=_require_env("QBITTORRENT_USERNAME"),
             qbittorrent_password=_require_env("QBITTORRENT_PASSWORD"),
-            qbittorrent_category=_require_env("QBITTORRENT_CATEGORY"),
+            qbittorrent_category=_parse_str_env("QBITTORRENT_CATEGORY", default=""),
             webhook_host=_parse_str_env("WEBHOOK_HOST", default="127.0.0.1"),
             webhook_port=_parse_int_env("WEBHOOK_PORT", default=8888),
             index_base_url=_parse_str_env("INDEX_BASE_URL", default=""),

@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,9 +21,10 @@ from pyrogram.types import (
 
 from ..config import BotConfig
 from ..services.auth import AuthorizationService
-from ..services.jackett import JackettService, SearchResult
+from ..services.jackett import JackettService, SearchResult, is_id_query
 from ..services.qbittorrent import qBittorrentService
 from ..services.tmdb import TMDbService
+from ..services.settings import SettingsService
 
 
 @dataclass
@@ -34,6 +36,19 @@ class ReleasePaginationSession:
     golden_popcorn: bool
     results: list[SearchResult]
     created_at: float
+
+
+@dataclass
+class ReleaseSearchSession:
+    session_id: str
+    requester_user_id: int
+    chat_id: int
+    query: str
+    golden_popcorn: bool
+    created_at: float
+    category: str | None = None
+    tag: str | None = None
+    tag_indexer_ids: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,7 @@ class CommandHandlers:
         auth_service: AuthorizationService,
         jackett_service: JackettService,
         tmdb_service: TMDbService,
+        settings_service: SettingsService,
         qbt_service: qBittorrentService,
         logger: logging.Logger,
     ):
@@ -63,9 +79,12 @@ class CommandHandlers:
         self.auth_service = auth_service
         self.jackett_service = jackett_service
         self.tmdb_service = tmdb_service
+        self.settings_service = settings_service
         self.qbt_service = qbt_service
         self.logger = logger
         self._pagination_sessions: dict[str, ReleasePaginationSession] = {}
+        self._search_sessions: dict[str, ReleaseSearchSession] = {}
+        self._list_sessions: dict[str, dict] = {}
         self._pagination_ttl_seconds = 3600
         self._redaction_delay_seconds = self.config.redact_after_seconds
         self._redaction_tasks: set[asyncio.Task] = set()
@@ -102,26 +121,176 @@ class CommandHandlers:
             chat_id,
         )
 
+        self._prune_expired_sessions()
+        session_id = uuid.uuid4().hex[:12]
+        session = ReleaseSearchSession(
+            session_id=session_id,
+            requester_user_id=user_id,
+            chat_id=chat_id,
+            query=query,
+            golden_popcorn=golden_popcorn,
+            created_at=time.time(),
+        )
+        self._search_sessions[session_id] = session
+
+        if is_id_query(query):
+            await self._show_tag_selection(message, session_id)
+        else:
+            await self._show_category_selection(message, session_id)
+
+    async def _show_category_selection(self, message: Message, session_id: str):
+        try:
+            categories = await self.jackett_service.get_categories()
+        except Exception as exc:
+            self.logger.warning("Failed to fetch categories: %s", exc)
+            categories = []
+
+        disabled = self.settings_service.get_disabled_categories()
+        active = [cat for cat in categories if cat.name not in disabled]
+        cat_buttons = [
+            InlineKeyboardButton(cat.name, callback_data=f"release_cat:{session_id}:{cat.name}")
+            for cat in active
+        ]
+        keyboard = [cat_buttons[i : i + 3] for i in range(0, len(cat_buttons), 3)]
+        keyboard.append(
+            [InlineKeyboardButton("All", callback_data=f"release_cat:{session_id}:All")]
+        )
+        try:
+            await message.reply_text(
+                "Select a category:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except FloodWait as exc:
+            self.logger.warning("FloodWait sending category selection | %s", exc.value)
+
+    async def release_cat(self, callback_query: CallbackQuery):
+        parts = callback_query.data.split(":")
+        if len(parts) != 3:
+            return await self._answer_callback(callback_query, "INVALID CALLBACK DATA")
+
+        _, session_id, category = parts
+        session = self._search_sessions.get(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+            return await self._answer_callback(
+                callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
+            )
+
+        session.category = category
+        await self._show_tag_selection(
+            callback_query.message, session_id, edit_message=True
+        )
+
+    async def _show_tag_selection(
+        self, message: Message, session_id: str, edit_message: bool = False
+    ):
+        if edit_message:
+            status_msg = message
+            await status_msg.edit_text("Fetching tags...")
+        else:
+            status_msg = await message.reply_text("Fetching tags...")
+
+        try:
+            tag_map = await self.jackett_service.get_tags_from_api()
+        except Exception as exc:
+            self.logger.warning("Failed to fetch tags: %s", exc)
+            tag_map = {}
+
+        session = self._search_sessions.get(session_id)
+        if session is not None:
+            session.tag_indexer_ids = None
+
+        tag_buttons = [
+            InlineKeyboardButton(tag, callback_data=f"release_tag:{session_id}:{tag}")
+            for tag in sorted(tag_map.keys())
+        ]
+        keyboard = [tag_buttons[i : i + 3] for i in range(0, len(tag_buttons), 3)]
+        keyboard.append(
+            [InlineKeyboardButton("All", callback_data=f"release_tag:{session_id}:All")]
+        )
+
+        if session is not None:
+            session.__dict__["_tag_map"] = tag_map
+
+        try:
+            await status_msg.edit_text(
+                "Select a tag:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except FloodWait as exc:
+            self.logger.warning("FloodWait editing to tag selection | %s", exc.value)
+
+    async def release_tag(self, callback_query: CallbackQuery):
+        parts = callback_query.data.split(":")
+        if len(parts) != 3:
+            return await self._answer_callback(callback_query, "INVALID CALLBACK DATA")
+
+        _, session_id, tag = parts
+        session = self._search_sessions.get(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+            return await self._answer_callback(
+                callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
+            )
+
+        session.tag = tag
+        if tag != "All":
+            tag_map: dict[str, list[str]] = session.__dict__.get("_tag_map") or {}
+            session.tag_indexer_ids = tag_map.get(tag) or None
+
+        reply_message = (
+            callback_query.message.reply_to_message
+            if callback_query.message.reply_to_message
+            else callback_query.message
+        )
+        try:
+            await callback_query.message.delete()
+        except Exception as exc:
+            self.logger.warning("Failed to delete message before search: %s", exc)
+
+        await self._execute_search(reply_message, session)
+
+    async def _execute_search(self, message: Message, search_session: ReleaseSearchSession):
         sent_message = await self._try_send_searching_message(message)
 
         try:
+            category_id = None
+            if search_session.category and search_session.category != "All":
+                categories = await self.jackett_service.get_categories()
+                matched = next((c for c in categories if c.name == search_session.category), None)
+                if matched:
+                    category_id = matched.id
+
+            indexer_ids = search_session.tag_indexer_ids if search_session.tag != "All" else None
+
             all_results = await self.jackett_service.search(
-                query, golden_popcorn=golden_popcorn
+                search_session.query,
+                golden_popcorn=search_session.golden_popcorn,
+                category=category_id,
+                indexer_ids=indexer_ids,
             )
             all_results = self._sort_results_by_resolution_priority(all_results)
 
             if not all_results:
-                no_results_suffix = " (with GP)" if golden_popcorn else ""
-                await self._reply_text(
-                    message, f"NO RESULTS{no_results_suffix}".upper()
-                )
+                suffix = " (with GP)" if search_session.golden_popcorn else ""
+                await self._reply_text(message, f"NO RESULTS{suffix}".upper())
                 return
 
             session = self._create_pagination_session(
-                requester_user_id=user_id,
-                chat_id=chat_id,
-                query=query,
-                golden_popcorn=golden_popcorn,
+                requester_user_id=search_session.requester_user_id,
+                chat_id=search_session.chat_id,
+                query=search_session.query,
+                golden_popcorn=search_session.golden_popcorn,
                 results=all_results,
             )
 
@@ -136,7 +305,7 @@ class CommandHandlers:
                 self.logger.warning(
                     "FloodWait while sending release results | wait_seconds=%s | chat_id=%s",
                     exc.value,
-                    chat_id,
+                    search_session.chat_id,
                 )
                 await self._reply_text(message, "TELEGRAM RATE LIMIT. TRY AGAIN LATER.")
                 return
@@ -172,14 +341,9 @@ class CommandHandlers:
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        message_chat_id = (
-            callback_query.message.chat.id if callback_query.message else 0
-        )
+        message_chat_id = callback_query.message.chat.id if callback_query.message else 0
 
-        if (
-            requester_id != session.requester_user_id
-            and requester_id != self.config.owner_id
-        ):
+        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
             await self._answer_callback(
                 callback_query, "PAGINATION BELONGS TO ANOTHER USER", show_alert=True
             )
@@ -198,9 +362,7 @@ class CommandHandlers:
             return
 
         try:
-            message_text, reply_markup = self._build_page_response(
-                session, requested_page
-            )
+            message_text, reply_markup = self._build_page_response(session, requested_page)
             await callback_query.message.edit_text(
                 message_text,
                 parse_mode=ParseMode.HTML,
@@ -222,6 +384,75 @@ class CommandHandlers:
                 callback_query, "UNABLE TO CHANGE PAGE RIGHT NOW", show_alert=False
             )
 
+    async def release_dl(self, callback_query: CallbackQuery):
+        parts = callback_query.data.split(":")
+        if len(parts) != 3:
+            return await self._answer_callback(callback_query, "INVALID DOWNLOAD REQUEST")
+
+        _, session_id, index_str = parts
+        try:
+            result_index = int(index_str)
+        except ValueError:
+            return await self._answer_callback(callback_query, "INVALID INDEX")
+
+        session = self._get_pagination_session(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED. RUN /RELEASE AGAIN.", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+            return await self._answer_callback(
+                callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
+            )
+
+        if result_index < 0 or result_index >= len(session.results):
+            return await self._answer_callback(callback_query, "RESULT NOT FOUND")
+
+        result = session.results[result_index]
+        url = result.download_url()
+        if not url:
+            return await self._answer_callback(
+                callback_query, "NO DOWNLOAD LINK AVAILABLE", show_alert=True
+            )
+
+        await self._answer_callback(callback_query, "ADDING TO QBITTORRENT...")
+        try:
+            success = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.qbt_service.add_torrent(
+                    url, extra_tags=[f"jack:{session.chat_id}"]
+                ),
+            )
+        except Exception as exc:
+            self.logger.error("Failed to add torrent to qBittorrent: %s", exc)
+            success = None
+            error_msg = str(exc)
+
+        msg = callback_query.message
+        if msg is None:
+            return
+
+        try:
+            current_text = msg.text or ""
+            if success:
+                appended = f"\n\n✅ <b>ADDED TO QBITTORRENT:</b>\n<code>{html.escape(result.title)}</code>"
+            elif success is False:
+                appended = f"\n\n❌ <b>QBITTORRENT REJECTED:</b>\n<code>{html.escape(result.title)}</code>"
+            else:
+                appended = f"\n\n❌ <b>QBITTORRENT ERROR:</b>\n<code>{html.escape(error_msg)}</code>"
+
+            await msg.edit_text(
+                current_text + appended,
+                parse_mode=ParseMode.HTML,
+                reply_markup=msg.reply_markup,
+            )
+        except FloodWait as exc:
+            self.logger.warning("FloodWait editing results after DL | %s", exc.value)
+        except Exception as exc:
+            self.logger.warning("Could not edit results message after DL: %s", exc)
+
     async def release_close(self, callback_query: CallbackQuery):
         session_id = self._parse_close_callback_data(callback_query.data)
         if not session_id:
@@ -238,14 +469,9 @@ class CommandHandlers:
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        message_chat_id = (
-            callback_query.message.chat.id if callback_query.message else 0
-        )
+        message_chat_id = callback_query.message.chat.id if callback_query.message else 0
 
-        if (
-            requester_id != session.requester_user_id
-            and requester_id != self.config.owner_id
-        ):
+        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
             await self._answer_callback(
                 callback_query, "ONLY REQUESTER OR OWNER CAN CLOSE", show_alert=True
             )
@@ -271,9 +497,7 @@ class CommandHandlers:
                 parse_mode=ParseMode.HTML,
                 reply_markup=None,
             )
-            await self._answer_callback(
-                callback_query, "RESULTS CLOSED", show_alert=False
-            )
+            await self._answer_callback(callback_query, "RESULTS CLOSED", show_alert=False)
         except FloodWait as exc:
             self.logger.warning(
                 "FloodWait while closing release message | wait_seconds=%s | session_id=%s",
@@ -453,6 +677,52 @@ class CommandHandlers:
 
         removed_count = self.auth_service.clear_authorized()
         await self._reply_text(message, f"CLEARED {removed_count} TEMP AUTHORIZATIONS")
+
+    async def settings(self, message: Message):
+        requester_id = message.from_user.id if message.from_user else 0
+        if not self._is_owner(requester_id):
+            await self._reply_text(message, "ONLY OWNER CAN USE /SETTINGS")
+            return
+
+        keyboard = await self._build_settings_keyboard()
+        await message.reply_text(
+            "<b>Bot Settings</b>\nToggle active categories:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+    async def settings_toggle(self, callback_query: CallbackQuery):
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if not self._is_owner(requester_id):
+            return await self._answer_callback(
+                callback_query, "ONLY OWNER CAN USE /SETTINGS", show_alert=True
+            )
+
+        parts = callback_query.data.split(":")
+        if len(parts) == 2:
+            self.settings_service.toggle_category(parts[1])
+
+        try:
+            keyboard = await self._build_settings_keyboard()
+            await callback_query.message.edit_reply_markup(keyboard)
+            await self._answer_callback(callback_query)
+        except Exception as exc:
+            self.logger.warning("Failed to update settings message: %s", exc)
+            await self._answer_callback(callback_query)
+
+    async def _build_settings_keyboard(self) -> InlineKeyboardMarkup:
+        try:
+            categories = await self.jackett_service.get_categories()
+        except Exception:
+            categories = []
+        disabled = self.settings_service.get_disabled_categories()
+        keyboard = []
+        for cat in categories:
+            status = "❌" if cat.name in disabled else "✅"
+            keyboard.append(
+                [InlineKeyboardButton(f"{status} {cat.name}", callback_data=f"settings_toggle:{cat.name}")]
+            )
+        return InlineKeyboardMarkup(keyboard)
 
     async def listtorrents(self, client, message: Message):
         user_id = message.from_user.id if message.from_user else 0
@@ -685,30 +955,9 @@ class CommandHandlers:
             self._listtorrents_loop(client, session_id, chat_id, message_id)
         )
 
-    @staticmethod
-    def _total_pages_count(total: int, page_size: int) -> int:
-        import math
-
-        return max(1, math.ceil(total / page_size))
-
-    @staticmethod
-    def _convert_size(size_bytes: int) -> str:
-        import math
-
-        if size_bytes == 0:
-            return "0 B"
-        size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-        index = int(math.floor(math.log(size_bytes, 1024)))
-        power = math.pow(1024, index)
-        size = round(size_bytes / power, 2)
-        return f"{size} {size_name[index]}"
-
     async def inline_query(self, inline_query: InlineQuery):
-        # We allow inline queries for everyone since the bot will only respond to
-        # the resulting `/release <imdb_id>` command in authorized chats anyway.
-        # Also, Pyrogram `InlineQuery` does not provide the target `chat.id` in all cases,
-        # so checking group authorization at this stage is not feasible.
-
+        # Inline queries are allowed for everyone — authorization checked when the
+        # resulting /release command is sent in an authorized chat.
         query = inline_query.query.strip()
         if not query:
             await inline_query.answer([], cache_time=0)
@@ -719,8 +968,7 @@ class CommandHandlers:
 
             inline_results = []
             for result in results:
-                if not result.imdb_id:
-                    continue
+                release_arg = result.imdb_id if result.imdb_id else f"tmdb:{result.id}"
 
                 lang = (result.original_language or "").upper()
                 media_label = result.media_type.capitalize()
@@ -734,7 +982,7 @@ class CommandHandlers:
                     InlineQueryResultArticle(
                         title=result.display_title,
                         input_message_content=InputTextMessageContent(
-                            f"/release {result.imdb_id}"
+                            f"/release {release_arg}"
                         ),
                         description=description,
                         thumb_url=result.thumb_url,
@@ -898,13 +1146,21 @@ class CommandHandlers:
 
     def _prune_expired_sessions(self):
         now = time.time()
-        expired_session_ids = [
-            session_id
-            for session_id, session in self._pagination_sessions.items()
-            if now - session.created_at > self._pagination_ttl_seconds
+        expired = [
+            sid
+            for sid, s in self._pagination_sessions.items()
+            if now - s.created_at > self._pagination_ttl_seconds
         ]
-        for session_id in expired_session_ids:
-            self._pagination_sessions.pop(session_id, None)
+        for sid in expired:
+            self._pagination_sessions.pop(sid, None)
+
+        expired_search = [
+            sid
+            for sid, s in self._search_sessions.items()
+            if now - s.created_at > self._pagination_ttl_seconds
+        ]
+        for sid in expired_search:
+            self._search_sessions.pop(sid, None)
 
     def _schedule_message_redaction(self, session_id: str, message: Message):
         task = asyncio.create_task(self._redact_message_later(session_id, message))
@@ -944,9 +1200,13 @@ class CommandHandlers:
         end_index = start_index + page_size
 
         page_results = session.results[start_index:end_index]
-        body = ""
-        for i, result in enumerate(page_results, start=1):
-            body += f"<b>{i}.</b> " + result.as_html() + "\n"
+        body_parts = []
+        for i, result in enumerate(page_results):
+            global_index = start_index + i
+            body_parts.append(
+                f"{global_index + 1}. {result.as_html()}"
+            )
+        body = "\n".join(body_parts)
 
         header_suffix = " (GP)" if session.golden_popcorn else ""
         header = (
@@ -956,26 +1216,22 @@ class CommandHandlers:
         )
 
         message_text = header + body
-
         keyboard_rows: list[list[InlineKeyboardButton]] = []
 
-        # Download buttons
-        download_buttons = []
-        for i in range(1, len(page_results) + 1):
-            global_idx = start_index + i - 1
-            download_buttons.append(
-                InlineKeyboardButton(
-                    f"↓ {i}",
-                    callback_data=f"qbt_add:{session.session_id}:{global_idx}",
+        dl_buttons: list[InlineKeyboardButton] = []
+        for i, result in enumerate(page_results):
+            global_index = start_index + i
+            if result.download_url():
+                dl_buttons.append(
+                    InlineKeyboardButton(
+                        f"⬇️ {global_index + 1}",
+                        callback_data=f"release_dl:{session.session_id}:{global_index}",
+                    )
                 )
-            )
-        if download_buttons:
-            # Split download buttons into rows of max 5
-            for i in range(0, len(download_buttons), 5):
-                keyboard_rows.append(download_buttons[i : i + 5])
+        for i in range(0, len(dl_buttons), 3):
+            keyboard_rows.append(dl_buttons[i : i + 3])
 
         nav_buttons: list[InlineKeyboardButton] = []
-
         if total_pages > 1 and page > 1:
             nav_buttons.append(
                 InlineKeyboardButton(
@@ -983,7 +1239,6 @@ class CommandHandlers:
                     callback_data=f"release_page:{session.session_id}:{page - 1}",
                 )
             )
-
         if total_pages > 1 and page < total_pages:
             nav_buttons.append(
                 InlineKeyboardButton(
@@ -991,7 +1246,6 @@ class CommandHandlers:
                     callback_data=f"release_page:{session.session_id}:{page + 1}",
                 )
             )
-
         if nav_buttons:
             keyboard_rows.append(nav_buttons)
 
@@ -1045,43 +1299,35 @@ class CommandHandlers:
     def _parse_close_callback_data(data: str | None) -> str | None:
         if not data:
             return None
-
         parts = data.split(":")
         if len(parts) != 2 or parts[0] != "release_close":
             return None
-
         return parts[1]
 
     @staticmethod
     def _parse_pagination_callback_data(data: str | None) -> tuple[str, int] | None:
         if not data:
             return None
-
         parts = data.split(":")
         if len(parts) != 3 or parts[0] != "release_page":
             return None
-
         session_id = parts[1]
         try:
             page = int(parts[2])
         except ValueError:
             return None
-
         return session_id, page
 
     @staticmethod
-    def _parse_qbt_add_callback_data(data: str | None) -> tuple[str, int] | None:
-        if not data:
-            return None
+    def _total_pages_count(total: int, page_size: int) -> int:
+        return max(1, math.ceil(total / page_size))
 
-        parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "qbt_add":
-            return None
-
-        session_id = parts[1]
-        try:
-            global_idx = int(parts[2])
-        except ValueError:
-            return None
-
-        return session_id, global_idx
+    @staticmethod
+    def _convert_size(size_bytes: int) -> str:
+        if size_bytes == 0:
+            return "0 B"
+        size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+        index = int(math.floor(math.log(size_bytes, 1024)))
+        power = math.pow(1024, index)
+        size = round(size_bytes / power, 2)
+        return f"{size} {size_name[index]}"

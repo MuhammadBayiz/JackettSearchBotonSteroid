@@ -1,24 +1,26 @@
 import asyncio
+import json
 import logging
+import os
 import sqlite3
+import tempfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 import aiohttp.web
 from aiohttp.web_request import Request
 from aiohttp.web_response import Response
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
 
 from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
 from .services.qbittorrent import qBittorrentService
+from .services.settings import SettingsService
 from .services.tmdb import TMDbService
-import json
-import os
-import tempfile
-from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
 
 try:
     from rich.logging import RichHandler
@@ -36,12 +38,14 @@ class JackettSearchBot:
 
         self._filters = filters
 
+        self.settings_service = SettingsService()
         self.auth_service = AuthorizationService(
             bootstrap_ids=self.config.authorized_chat_ids,
         )
         self.jackett_service = JackettService(
             jackett_url=self.config.jackett_url,
             jackett_api_key=self.config.jackett_api_key,
+            jackett_password=self.config.jackett_password,
         )
         self.tmdb_service = TMDbService(
             tmdb_api_key=self.config.tmdb_api_key,
@@ -58,6 +62,7 @@ class JackettSearchBot:
             auth_service=self.auth_service,
             jackett_service=self.jackett_service,
             tmdb_service=self.tmdb_service,
+            settings_service=self.settings_service,
             qbt_service=self.qbt_service,
             logger=self.logger,
         )
@@ -94,9 +99,29 @@ class JackettSearchBot:
         async def unauthall_handler(client, message):
             await self.handlers.unauthall(message)
 
+        @self.app.on_message(self._filters.command("settings"))
+        async def settings_handler(client, message):
+            await self.handlers.settings(message)
+
         @self.app.on_message(self._filters.command("listtorrents"))
         async def listtorrents_handler(client, message):
             await self.handlers.listtorrents(client, message)
+
+        @self.app.on_callback_query(self._filters.regex(r"^settings_toggle:"))
+        async def settings_toggle_handler(client, callback_query):
+            await self.handlers.settings_toggle(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^release_cat:"))
+        async def release_cat_handler(client, callback_query):
+            await self.handlers.release_cat(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^release_tag:"))
+        async def release_tag_handler(client, callback_query):
+            await self.handlers.release_tag(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^release_dl:"))
+        async def release_dl_handler(client, callback_query):
+            await self.handlers.release_dl(callback_query)
 
         @self.app.on_callback_query(self._filters.regex(r"^release_page:"))
         async def release_page_handler(client, callback_query):
@@ -105,10 +130,6 @@ class JackettSearchBot:
         @self.app.on_callback_query(self._filters.regex(r"^release_close:"))
         async def release_close_handler(client, callback_query):
             await self.handlers.release_close(callback_query)
-
-        @self.app.on_callback_query(self._filters.regex(r"^qbt_add:"))
-        async def qbt_add_handler(client, callback_query):
-            await self.handlers.qbt_add(callback_query)
 
         @self.app.on_callback_query(self._filters.regex(r"^list_page:"))
         async def list_page_handler(client, callback_query):
@@ -142,20 +163,14 @@ class JackettSearchBot:
 
         for video_path in video_files:
             try:
-                # Run ffprobe to get subtitle streams
                 cmd = [
-                    "ffprobe",
-                    "-v",
-                    "quiet",
-                    "-print_format",
-                    "json",
-                    "-show_streams",
-                    "-select_streams",
-                    "s",
-                    video_path,
+                    "ffprobe", "-v", "quiet", "-print_format", "json",
+                    "-show_streams", "-select_streams", "s", video_path,
                 ]
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await proc.communicate()
 
@@ -164,24 +179,15 @@ class JackettSearchBot:
                     continue
 
                 streams_data = json.loads(stdout.decode())
-                streams = streams_data.get("streams", [])
-
-                for stream in streams:
+                for stream in streams_data.get("streams", []):
                     tags = stream.get("tags", {})
                     lang = tags.get("language", "und").lower()
                     title = tags.get("title", "")
 
-                    # Convert to 3-letter format if needed (e.g. en -> eng)
                     if len(lang) == 2:
                         lang_map = {
-                            "en": "eng",
-                            "es": "spa",
-                            "fr": "fre",
-                            "de": "ger",
-                            "it": "ita",
-                            "ar": "ara",
-                            "ru": "rus",
-                            "zh": "chi",
+                            "en": "eng", "es": "spa", "fr": "fre", "de": "ger",
+                            "it": "ita", "ar": "ara", "ru": "rus", "zh": "chi",
                             "ja": "jpn",
                         }
                         lang = lang_map.get(lang, lang)
@@ -189,35 +195,22 @@ class JackettSearchBot:
                     if lang in target_langs or "all" in target_langs:
                         stream_index = stream.get("index")
                         codec_name = stream.get("codec_name", "")
-
-                        # Prepare output filename
                         base_name = os.path.splitext(os.path.basename(video_path))[0]
                         out_filename = f"{base_name}.{lang}.srt"
-
                         caption_text = lang.upper()
                         if title:
                             caption_text += f" - {title}"
 
                         with tempfile.TemporaryDirectory() as tmpdir:
                             out_path = os.path.join(tmpdir, out_filename)
-
-                            # Determine output format based on codec if necessary, but forcing srt usually works for most text sub codecs
                             ffmpeg_cmd = [
-                                "ffmpeg",
-                                "-y",
-                                "-v",
-                                "quiet",
-                                "-i",
-                                video_path,
-                                "-map",
-                                f"0:{stream_index}",
+                                "ffmpeg", "-y", "-v", "quiet", "-i", video_path,
+                                "-map", f"0:{stream_index}",
                             ]
-
                             if codec_name == "subrip":
                                 ffmpeg_cmd.extend(["-c:s", "copy"])
                             else:
                                 ffmpeg_cmd.extend(["-c:s", "srt"])
-
                             ffmpeg_cmd.append(out_path)
 
                             extract_proc = await asyncio.create_subprocess_exec(
@@ -227,9 +220,7 @@ class JackettSearchBot:
                             )
                             await extract_proc.communicate()
 
-                            if extract_proc.returncode == 0 and os.path.exists(
-                                out_path
-                            ):
+                            if extract_proc.returncode == 0 and os.path.exists(out_path):
                                 await self.app.send_document(
                                     chat_id=chat_id,
                                     document=out_path,
@@ -239,8 +230,7 @@ class JackettSearchBot:
                             else:
                                 self.logger.warning(
                                     "Failed to extract subtitle %s from %s",
-                                    stream_index,
-                                    video_path,
+                                    stream_index, video_path,
                                 )
             except Exception as exc:
                 self.logger.exception(
@@ -257,21 +247,17 @@ class JackettSearchBot:
                 try:
                     payload = await request.json()
                 except Exception:
-                    # Fallback if shell quoting broke the JSON
                     raw_text = await request.text()
                     self.logger.warning(
                         "Failed to parse JSON cleanly, attempting manual parse. Raw: %s",
                         raw_text,
                     )
                     import ast
-
                     try:
-                        # Try to parse python dict string (e.g. {hash: ...} missing quotes)
                         payload = ast.literal_eval(raw_text)
                     except Exception:
                         payload = {}
             else:
-                # Form data / urlencoded
                 payload = await request.post()
 
             torrent_name = payload.get("name", "Unknown torrent")
@@ -291,26 +277,13 @@ class JackettSearchBot:
             if chat_id is not None:
                 text_msg = f"<b>{torrent_name}</b> torrent downloaded."
 
-                # Index URL Mapping
-                if (
-                    content_path
-                    and self.config.index_base_url
-                    and self.config.media_local_path
-                ):
-                    # Strip the media_local_path prefix if it exists
+                if content_path and self.config.index_base_url and self.config.media_local_path:
                     rel_path = content_path
                     if content_path.startswith(self.config.media_local_path):
-                        rel_path = content_path[len(self.config.media_local_path) :]
+                        rel_path = content_path[len(self.config.media_local_path):]
                     rel_path = rel_path.lstrip("/")
-
-                    from urllib.parse import quote
-
-                    # URL encode the parts but keep the slashes
                     url_parts = [quote(p) for p in rel_path.split("/")]
-                    encoded_rel_path = "/".join(url_parts)
-
-                    base_url = self.config.index_base_url.rstrip("/")
-                    index_url = f"{base_url}/{encoded_rel_path}"
+                    index_url = f"{self.config.index_base_url.rstrip('/')}/{'/'.join(url_parts)}"
                     text_msg += f"\n\n<b>Download URL:</b>\n{index_url}"
 
                 await self.app.send_message(
@@ -337,9 +310,9 @@ class JackettSearchBot:
             )
 
     async def start_webhook_server(self):
-        app = aiohttp.web.Application()
-        app.router.add_post("/webhook/torrent-done", self.handle_torrent_done)
-        runner = aiohttp.web.AppRunner(app)
+        web_app = aiohttp.web.Application()
+        web_app.router.add_post("/webhook/torrent-done", self.handle_torrent_done)
+        runner = aiohttp.web.AppRunner(web_app)
         await runner.setup()
         site = aiohttp.web.TCPSite(
             runner, self.config.webhook_host, self.config.webhook_port
@@ -366,19 +339,14 @@ class JackettSearchBot:
         except sqlite3.OperationalError as exc:
             if "database is locked" in str(exc).lower():
                 self.logger.error(
-                    "Session database is locked. This usually means another bot instance is still running "
-                    "or a stale session lock exists."
-                )
-                self.logger.error(
-                    "Action: stop other instances, remove any stale session lock if needed, and retry. "
-                    "This build uses a persisted session to reduce repeated bot re-authorization on restart."
+                    "Session database is locked. Another instance may be running."
                 )
                 raise SystemExit(2) from exc
             self.logger.exception("SQLite operational error while starting bot.")
             raise
         except FloodWait as exc:
             self.logger.error(
-                "Telegram rate limited bot authorization/startup. Wait %s seconds before retrying.",
+                "Telegram rate limited bot startup. Wait %s seconds before retrying.",
                 exc.value,
             )
             raise SystemExit(3) from exc
@@ -407,11 +375,8 @@ class JackettSearchBot:
 
         if RichHandler is not None:
             console_handler = RichHandler(
-                show_time=True,
-                show_level=True,
-                show_path=False,
-                markup=False,
-                rich_tracebacks=True,
+                show_time=True, show_level=True, show_path=False,
+                markup=False, rich_tracebacks=True,
             )
             console_format = "%(message)s"
         else:
@@ -422,10 +387,8 @@ class JackettSearchBot:
         console_handler.setFormatter(logging.Formatter(console_format))
 
         file_handler = RotatingFileHandler(
-            filename=log_path,
-            maxBytes=10 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8",
+            filename=log_path, maxBytes=10 * 1024 * 1024,
+            backupCount=5, encoding="utf-8",
         )
         file_handler.setLevel(self.config.file_log_level)
         file_handler.setFormatter(
