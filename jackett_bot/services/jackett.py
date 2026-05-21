@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import math
 import xml.etree.ElementTree as ET
@@ -213,12 +214,47 @@ class JackettService:
 
         url = self.build_search_url(query, category=category, indexer_ids=indexer_ids, force_text=force_text)
         response = await self._client.get(url, timeout=timeout)
+
+        # Torznab returns 500 if any indexer in the list errors (e.g. auth failure).
+        # Fall back to searching each indexer individually so one bad indexer
+        # doesn't suppress results from the others.
+        if response.status_code == 500 and indexer_ids:
+            return await self._search_indexers_individually(
+                query, golden_popcorn=golden_popcorn, category=category,
+                indexer_ids=indexer_ids, force_text=force_text, timeout=timeout,
+            )
+
         response.raise_for_status()
 
         if not response.text.strip():
             return []
 
         return parse_search_results(response.content, golden_popcorn=golden_popcorn)
+
+    async def _search_indexers_individually(
+        self,
+        query: str,
+        golden_popcorn: bool = False,
+        category: str | None = None,
+        indexer_ids: list[str] | None = None,
+        force_text: bool = False,
+        timeout: int = 60,
+    ) -> list[SearchResult]:
+        async def _one(indexer_id: str) -> list[SearchResult]:
+            url = self.build_search_url(query, category=category, indexer_ids=[indexer_id], force_text=force_text)
+            try:
+                response = await self._client.get(url, timeout=timeout)
+                if not response.is_success or not response.text.strip():
+                    return []
+                return parse_search_results(response.content, golden_popcorn=golden_popcorn)
+            except Exception:
+                return []
+
+        results_per_indexer = await asyncio.gather(*[_one(i) for i in (indexer_ids or [])])
+        merged: list[SearchResult] = []
+        for results in results_per_indexer:
+            merged.extend(results)
+        return merged
 
     async def close(self):
         if self._owns_client:
