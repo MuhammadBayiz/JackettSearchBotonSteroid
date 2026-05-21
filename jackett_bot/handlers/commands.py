@@ -22,6 +22,29 @@ from ..config import BotConfig
 from ..services.auth import AuthorizationService
 from ..services.jackett import JackettService, SearchResult
 from ..services.tmdb import TMDbService
+from ..services.settings import SettingsService
+
+AVAILABLE_CATEGORIES = [
+    "Movies",
+    "TV",
+    "XXX",
+    "Audio",
+    "Books",
+    "PC",
+    "Console",
+    "Others",
+]
+
+CATEGORY_MAPPING = {
+    "Movies": "2000",
+    "TV": "5000",
+    "XXX": "6000",
+    "Audio": "3000",
+    "Books": "7000,8000",
+    "PC": "4000",
+    "Console": "1000",
+    "Others": "8000",
+}
 
 
 @dataclass
@@ -32,6 +55,18 @@ class ReleasePaginationSession:
     query: str
     golden_popcorn: bool
     results: list[SearchResult]
+    created_at: float
+
+
+@dataclass
+class ReleaseSearchSession:
+    session_id: str
+    requester_user_id: int
+    chat_id: int
+    query: str
+    golden_popcorn: bool
+    category: str | None
+    tag: str | None
     created_at: float
 
 
@@ -55,14 +90,17 @@ class CommandHandlers:
         auth_service: AuthorizationService,
         jackett_service: JackettService,
         tmdb_service: TMDbService,
+        settings_service: SettingsService,
         logger: logging.Logger,
     ):
         self.config = config
         self.auth_service = auth_service
         self.jackett_service = jackett_service
         self.tmdb_service = tmdb_service
+        self.settings_service = settings_service
         self.logger = logger
         self._pagination_sessions: dict[str, ReleasePaginationSession] = {}
+        self._search_sessions: dict[str, ReleaseSearchSession] = {}
         self._pagination_ttl_seconds = 3600
         self._redaction_delay_seconds = self.config.redact_after_seconds
         self._redaction_tasks: set[asyncio.Task] = set()
@@ -97,26 +135,175 @@ class CommandHandlers:
             chat_id,
         )
 
+        self._prune_expired_sessions()
+        session_id = uuid.uuid4().hex[:12]
+        session = ReleaseSearchSession(
+            session_id=session_id,
+            requester_user_id=user_id,
+            chat_id=chat_id,
+            query=query,
+            golden_popcorn=golden_popcorn,
+            category=None,
+            tag=None,
+            created_at=time.time(),
+        )
+        self._search_sessions[session_id] = session
+
+        is_imdb = query.startswith("tt") and query[2:].isdigit()
+
+        if is_imdb:
+            await self._show_tag_selection(message, session_id)
+        else:
+            await self._show_category_selection(message, session_id)
+
+    async def _show_category_selection(self, message: Message, session_id: str):
+        disabled = self.settings_service.get_disabled_categories()
+        keyboard = []
+        for cat in AVAILABLE_CATEGORIES:
+            if cat not in disabled:
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            cat, callback_data=f"release_cat:{session_id}:{cat}"
+                        )
+                    ]
+                )
+        keyboard.append(
+            [InlineKeyboardButton("All", callback_data=f"release_cat:{session_id}:All")]
+        )
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            await message.reply_text("Select a category:", reply_markup=reply_markup)
+        except FloodWait as exc:
+            self.logger.warning("FloodWait sending category selection | %s", exc.value)
+
+    async def release_cat(self, callback_query: CallbackQuery):
+        parts = callback_query.data.split(":")
+        if len(parts) != 3:
+            return await self._answer_callback(callback_query, "INVALID CALLBACK DATA")
+
+        session_id, category = parts[1], parts[2]
+        session = self._search_sessions.get(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
+            return await self._answer_callback(
+                callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
+            )
+
+        session.category = category
+        await self._show_tag_selection(
+            callback_query.message, session_id, edit_message=True
+        )
+
+    async def _show_tag_selection(
+        self, message: Message, session_id: str, edit_message: bool = False
+    ):
+        if edit_message:
+            sent_msg = message
+            await sent_msg.edit_text("Fetching tags...")
+        else:
+            sent_msg = await message.reply_text("Fetching tags...")
+
+        try:
+            tags = await self.jackett_service.get_tags_from_api()
+        except Exception as exc:
+            self.logger.warning("Failed to fetch tags: %s", exc)
+            tags = []
+
+        keyboard = []
+        for tag in tags:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        tag, callback_data=f"release_tag:{session_id}:{tag}"
+                    )
+                ]
+            )
+        keyboard.append(
+            [InlineKeyboardButton("All", callback_data=f"release_tag:{session_id}:All")]
+        )
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            await sent_msg.edit_text("Select a tag:", reply_markup=reply_markup)
+        except FloodWait as exc:
+            self.logger.warning("FloodWait editing to tag selection | %s", exc.value)
+
+    async def release_tag(self, callback_query: CallbackQuery):
+        parts = callback_query.data.split(":")
+        if len(parts) != 3:
+            return await self._answer_callback(callback_query, "INVALID CALLBACK DATA")
+
+        session_id, tag = parts[1], parts[2]
+        session = self._search_sessions.get(session_id)
+        if not session:
+            return await self._answer_callback(
+                callback_query, "SESSION EXPIRED", show_alert=True
+            )
+
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
+            return await self._answer_callback(
+                callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
+            )
+
+        session.tag = tag
+
+        reply_message = (
+            callback_query.message.reply_to_message
+            if callback_query.message.reply_to_message
+            else callback_query.message
+        )
+        try:
+            await callback_query.message.delete()
+        except Exception as exc:
+            self.logger.warning("Failed to delete message before search: %s", exc)
+        await self._execute_search(reply_message, session)
+
+    async def _execute_search(
+        self, message: Message, search_session: ReleaseSearchSession
+    ):
         sent_message = await self._try_send_searching_message(message)
 
         try:
+            cat_id = None
+            if search_session.category and search_session.category != "All":
+                cat_id = CATEGORY_MAPPING.get(search_session.category)
+
             all_results = await self.jackett_service.search(
-                query, golden_popcorn=golden_popcorn
+                search_session.query,
+                golden_popcorn=search_session.golden_popcorn,
+                category=cat_id,
+                tag=search_session.tag,
             )
             all_results = self._sort_results_by_resolution_priority(all_results)
 
             if not all_results:
-                no_results_suffix = " (with GP)" if golden_popcorn else ""
+                no_results_suffix = (
+                    " (with GP)" if search_session.golden_popcorn else ""
+                )
                 await self._reply_text(
                     message, f"NO RESULTS{no_results_suffix}".upper()
                 )
                 return
 
             session = self._create_pagination_session(
-                requester_user_id=user_id,
-                chat_id=chat_id,
-                query=query,
-                golden_popcorn=golden_popcorn,
+                requester_user_id=search_session.requester_user_id,
+                chat_id=search_session.chat_id,
+                query=search_session.query,
+                golden_popcorn=search_session.golden_popcorn,
                 results=all_results,
             )
 
@@ -131,7 +318,7 @@ class CommandHandlers:
                 self.logger.warning(
                     "FloodWait while sending release results | wait_seconds=%s | chat_id=%s",
                     exc.value,
-                    chat_id,
+                    search_session.chat_id,
                 )
                 await self._reply_text(message, "TELEGRAM RATE LIMIT. TRY AGAIN LATER.")
                 return
@@ -361,6 +548,55 @@ class CommandHandlers:
         removed_count = self.auth_service.clear_authorized()
         await self._reply_text(message, f"CLEARED {removed_count} TEMP AUTHORIZATIONS")
 
+    async def settings(self, message: Message):
+        requester_id = message.from_user.id if message.from_user else 0
+        if not self._is_owner(requester_id):
+            await self._reply_text(message, "ONLY OWNER CAN USE /SETTINGS")
+            return
+
+        reply_markup = self._build_settings_keyboard()
+        await message.reply_text(
+            "<b>Bot Settings</b>\nToggle active categories:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+
+    async def settings_toggle(self, callback_query: CallbackQuery):
+        requester_id = callback_query.from_user.id if callback_query.from_user else 0
+        if not self._is_owner(requester_id):
+            await self._answer_callback(
+                callback_query, "ONLY OWNER CAN USE /SETTINGS", show_alert=True
+            )
+            return
+
+        parts = callback_query.data.split(":")
+        if len(parts) == 2:
+            category = parts[1]
+            if category in AVAILABLE_CATEGORIES:
+                self.settings_service.toggle_category(category)
+
+        reply_markup = self._build_settings_keyboard()
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup)
+            await self._answer_callback(callback_query)
+        except Exception as exc:
+            self.logger.warning("Failed to update settings message: %s", exc)
+            await self._answer_callback(callback_query)
+
+    def _build_settings_keyboard(self) -> InlineKeyboardMarkup:
+        disabled = self.settings_service.get_disabled_categories()
+        keyboard = []
+        for cat in AVAILABLE_CATEGORIES:
+            status = "❌" if cat in disabled else "✅"
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{status} {cat}", callback_data=f"settings_toggle:{cat}"
+                    )
+                ]
+            )
+        return InlineKeyboardMarkup(keyboard)
+
     async def inline_query(self, inline_query: InlineQuery):
         # We allow inline queries for everyone since the bot will only respond to
         # the resulting `/release <imdb_id>` command in authorized chats anyway.
@@ -563,6 +799,14 @@ class CommandHandlers:
         ]
         for session_id in expired_session_ids:
             self._pagination_sessions.pop(session_id, None)
+
+        expired_search_ids = [
+            session_id
+            for session_id, session in self._search_sessions.items()
+            if now - session.created_at > self._pagination_ttl_seconds
+        ]
+        for session_id in expired_search_ids:
+            self._search_sessions.pop(session_id, None)
 
     def _schedule_message_redaction(self, session_id: str, message: Message):
         task = asyncio.create_task(self._redact_message_later(session_id, message))

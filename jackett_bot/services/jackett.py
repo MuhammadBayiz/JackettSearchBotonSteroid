@@ -40,23 +40,49 @@ class JackettService:
         self._client = client or httpx.AsyncClient()
         self._owns_client = client is None
 
-    def build_search_url(self, query: str) -> str:
-        if query.startswith("tt") and query[2:].isdigit():
-            return (
-                f"{self.jackett_url}/api/v2.0/indexers/all/results/torznab/api"
-                f"?apikey={self.jackett_api_key}&imdbid={query}"
-            )
+    def build_search_url(
+        self, query: str, category: str | None = None, tag: str | None = None
+    ) -> str:
+        indexer_path = "all"
+        if tag and tag.lower() != "all":
+            indexer_path = f"tag:{quote(tag)}"
 
-        encoded_query = quote(query)
-        return (
-            f"{self.jackett_url}/api/v2.0/indexers/all/results/torznab/api"
-            f"?apikey={self.jackett_api_key}&t=search&q={encoded_query}"
-        )
+        if query.startswith("tt") and query[2:].isdigit():
+            url = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api?apikey={self.jackett_api_key}&imdbid={query}"
+        else:
+            encoded_query = quote(query)
+            url = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api?apikey={self.jackett_api_key}&t=search&q={encoded_query}"
+
+        if category and category.lower() != "all":
+            url += f"&cat={category}"
+
+        return url
+
+    async def get_tags_from_api(self, timeout: int = 60) -> list[str]:
+        url = f"{self.jackett_url}/api/v2.0/indexers?apikey={self.jackett_api_key}"
+        try:
+            response = await self._client.get(url, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            tags = set()
+            for indexer in data:
+                if "tags" in indexer:
+                    for t in indexer["tags"]:
+                        tags.add(t)
+            return sorted(list(tags))
+        except Exception:
+            return []
 
     async def search(
-        self, query: str, golden_popcorn: bool = False, timeout: int = 60
+        self,
+        query: str,
+        golden_popcorn: bool = False,
+        category: str | None = None,
+        tag: str | None = None,
+        timeout: int = 60,
     ) -> list[SearchResult]:
-        response = await self._client.get(self.build_search_url(query), timeout=timeout)
+        url = self.build_search_url(query, category=category, tag=tag)
+        response = await self._client.get(url, timeout=timeout)
         response.raise_for_status()
 
         if not response.text.strip():

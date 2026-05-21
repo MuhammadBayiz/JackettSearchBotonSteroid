@@ -8,6 +8,7 @@ from .config import BotConfig
 from .services.auth import AuthorizationService
 from .services.jackett import JackettService
 from .services.tmdb import TMDbService
+from .services.settings import SettingsService
 from pyrogram.errors import FloodWait
 
 try:
@@ -26,6 +27,7 @@ class JackettSearchBot:
 
         self._filters = filters
 
+        self.settings_service = SettingsService()
         self.auth_service = AuthorizationService(
             bootstrap_ids=self.config.authorized_chat_ids,
         )
@@ -42,6 +44,7 @@ class JackettSearchBot:
             auth_service=self.auth_service,
             jackett_service=self.jackett_service,
             tmdb_service=self.tmdb_service,
+            settings_service=self.settings_service,
             logger=self.logger,
         )
 
@@ -77,6 +80,14 @@ class JackettSearchBot:
         async def unauthall_handler(client, message):
             await self.handlers.unauthall(message)
 
+        @self.app.on_message(self._filters.command("settings"))
+        async def settings_handler(client, message):
+            await self.handlers.settings(message)
+
+        @self.app.on_callback_query(self._filters.regex(r"^settings_toggle:"))
+        async def settings_toggle_handler(client, callback_query):
+            await self.handlers.settings_toggle(callback_query)
+
         @self.app.on_callback_query(self._filters.regex(r"^release_page:"))
         async def release_page_handler(client, callback_query):
             await self.handlers.release_page(callback_query)
@@ -84,6 +95,14 @@ class JackettSearchBot:
         @self.app.on_callback_query(self._filters.regex(r"^release_close:"))
         async def release_close_handler(client, callback_query):
             await self.handlers.release_close(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^release_cat:"))
+        async def release_cat_handler(client, callback_query):
+            await self.handlers.release_cat(callback_query)
+
+        @self.app.on_callback_query(self._filters.regex(r"^release_tag:"))
+        async def release_tag_handler(client, callback_query):
+            await self.handlers.release_tag(callback_query)
 
         @self.app.on_inline_query()
         async def inline_query_handler(client, inline_query):
