@@ -21,14 +21,20 @@ class SearchResult:
     size_bytes: int
     link: str | None = None
     magnet: str | None = None
+    seeds: int = 0
+    leeches: int = 0
+    indexer: str = ""
 
     def download_url(self) -> str | None:
         return self.magnet or self.link
 
     def as_html(self) -> str:
+        title_line = html.escape(self.title)
+        if self.indexer:
+            title_line += f" - {html.escape(self.indexer)}"
         return (
-            f"<b>Title:</b> <code>{html.escape(self.title)}</code>\n"
-            f"<b>Age:</b> {self.age}\n"
+            f"<b>Title:</b> <code>{title_line}</code>\n"
+            f"<b>Age:</b> {self.age}  ↑{self.seeds} ↓{self.leeches}\n"
             f"<b>Size:</b> {self.size}\n"
         )
 
@@ -325,6 +331,11 @@ def parse_search_results(
         if size_bytes is None:
             continue
 
+        seeds = _safe_int(_get_torznab_attr(item, "seeders") or "") or 0
+        leeches = _safe_int(_get_torznab_attr(item, "peers") or "") or 0
+        indexer_el = item.find("jackettindexer")
+        indexer = indexer_el.text if indexer_el is not None and indexer_el.text else ""
+
         results.append(
             SearchResult(
                 title=title,
@@ -333,6 +344,9 @@ def parse_search_results(
                 size_bytes=size_bytes,
                 link=_get_item_text(item, "link"),
                 magnet=_get_torznab_attr(item, "magneturl"),
+                seeds=seeds,
+                leeches=leeches,
+                indexer=indexer,
             )
         )
 
