@@ -3,11 +3,13 @@ from __future__ import annotations
 import html
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import quote
 
 import httpx
+
+_TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,11 @@ class SearchResult:
     age: str
     size: str
     size_bytes: int
+    link: str | None = None
+    magnet: str | None = None
+
+    def download_url(self) -> str | None:
+        return self.magnet or self.link
 
     def as_html(self) -> str:
         return (
@@ -40,23 +47,58 @@ class JackettService:
         self._client = client or httpx.AsyncClient()
         self._owns_client = client is None
 
-    def build_search_url(self, query: str) -> str:
-        if query.startswith("tt") and query[2:].isdigit():
-            return (
-                f"{self.jackett_url}/api/v2.0/indexers/all/results/torznab/api"
-                f"?apikey={self.jackett_api_key}&imdbid={query}"
-            )
+    def build_search_url(
+        self,
+        query: str,
+        category: str | None = None,
+        indexer_ids: list[str] | None = None,
+    ) -> str:
+        if indexer_ids:
+            indexer_path = ",".join(indexer_ids)
+        else:
+            indexer_path = "all"
 
-        encoded_query = quote(query)
-        return (
-            f"{self.jackett_url}/api/v2.0/indexers/all/results/torznab/api"
-            f"?apikey={self.jackett_api_key}&t=search&q={encoded_query}"
-        )
+        base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
+
+        if query.startswith("tt") and query[2:].isdigit():
+            url = f"{base}?apikey={self.jackett_api_key}&imdbid={query}"
+        else:
+            url = f"{base}?apikey={self.jackett_api_key}&t=search&q={quote(query)}"
+
+        if category:
+            url += f"&cat={category}"
+
+        return url
+
+    async def get_tags_from_api(self, timeout: int = 30) -> dict[str, list[str]]:
+        """Return {tag: [indexer_id, ...]} for all configured indexers that have tags."""
+        url = f"{self.jackett_url}/api/v2.0/indexers?configured=true&apikey={self.jackett_api_key}"
+        try:
+            response = await self._client.get(url, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return {}
+
+        tag_map: dict[str, list[str]] = {}
+        for indexer in data:
+            indexer_id = indexer.get("id", "")
+            tags = indexer.get("tags") or []
+            for tag in tags:
+                tag_map.setdefault(tag, []).append(indexer_id)
+
+        return tag_map
 
     async def search(
-        self, query: str, golden_popcorn: bool = False, timeout: int = 60
+        self,
+        query: str,
+        golden_popcorn: bool = False,
+        category: str | None = None,
+        indexer_ids: list[str] | None = None,
+        timeout: int = 60,
     ) -> list[SearchResult]:
-        response = await self._client.get(self.build_search_url(query), timeout=timeout)
+        url = self.build_search_url(query, category=category, indexer_ids=indexer_ids)
+        response = await self._client.get(url, timeout=timeout)
         response.raise_for_status()
 
         if not response.text.strip():
@@ -121,12 +163,17 @@ def parse_search_results(
         if size_bytes is None:
             continue
 
+        link = _get_item_text(item, "link")
+        magnet = _get_torznab_attr(item, "magneturl")
+
         results.append(
             SearchResult(
                 title=title,
                 age=format_pub_date(pub_date),
                 size=convert_size(size_bytes),
                 size_bytes=size_bytes,
+                link=link,
+                magnet=magnet,
             )
         )
 
@@ -136,6 +183,13 @@ def parse_search_results(
 def _get_item_text(item: ET.Element, tag: str) -> str | None:
     element = item.find(tag)
     return element.text if element is not None else None
+
+
+def _get_torznab_attr(item: ET.Element, attr_name: str) -> str | None:
+    for attr_el in item.findall(f"{{{_TORZNAB_NS}}}attr"):
+        if attr_el.get("name") == attr_name:
+            return attr_el.get("value")
+    return None
 
 
 def _safe_int(value: str) -> int | None:
