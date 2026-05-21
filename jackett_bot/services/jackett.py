@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import math
 import xml.etree.ElementTree as ET
@@ -20,14 +21,20 @@ class SearchResult:
     size_bytes: int
     link: str | None = None
     magnet: str | None = None
+    seeds: int = 0
+    leeches: int = 0
+    indexer: str = ""
 
     def download_url(self) -> str | None:
         return self.magnet or self.link
 
     def as_html(self) -> str:
+        title_line = html.escape(self.title)
+        if self.indexer:
+            title_line += f" - {html.escape(self.indexer)}"
         return (
-            f"<b>Title:</b> <code>{html.escape(self.title)}</code>\n"
-            f"<b>Age:</b> {self.age}\n"
+            f"<b>Title:</b> <code>{title_line}</code>\n"
+            f"<b>Age:</b> {self.age}  ↑{self.seeds} ↓{self.leeches}\n"
             f"<b>Size:</b> {self.size}\n"
         )
 
@@ -68,19 +75,59 @@ class JackettService:
         self._client = client or httpx.AsyncClient(follow_redirects=True)
         self._owns_client = client is None
         self._categories_cache: list[JackettCategory] | None = None
+        self._indexer_caps_cache: dict[str, set[str]] = {}
+
+    async def get_indexer_supported_params(
+        self, indexer_id: str, timeout: int = 30
+    ) -> set[str]:
+        """Return the set of supported search params for an indexer (cached)."""
+        if indexer_id in self._indexer_caps_cache:
+            return self._indexer_caps_cache[indexer_id]
+
+        url = (
+            f"{self.jackett_url}/api/v2.0/indexers/{indexer_id}/results/torznab/api"
+            f"?apikey={self.jackett_api_key}&t=caps"
+        )
+        try:
+            response = await self._client.get(url, timeout=timeout)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            params: set[str] = set()
+            for el in root.findall(".//searching/*"):
+                if el.get("available") == "yes":
+                    for p in el.get("supportedParams", "").split(","):
+                        p = p.strip()
+                        if p:
+                            params.add(p)
+        except Exception:
+            params = set()
+
+        self._indexer_caps_cache[indexer_id] = params
+        return params
+
+    async def all_indexers_support_param(
+        self, indexer_ids: list[str], param: str, timeout: int = 30
+    ) -> bool:
+        """Return True only if every indexer in the list supports the given param."""
+        for indexer_id in indexer_ids:
+            supported = await self.get_indexer_supported_params(indexer_id, timeout=timeout)
+            if param not in supported:
+                return False
+        return True
 
     def build_search_url(
         self,
         query: str,
         category: str | None = None,
         indexer_ids: list[str] | None = None,
+        force_text: bool = False,
     ) -> str:
         indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
         base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
 
-        if _is_imdb_id(query):
+        if not force_text and _is_imdb_id(query):
             url = f"{base}?apikey={self.jackett_api_key}&imdbid={query}"
-        elif _is_tmdb_id(query):
+        elif not force_text and _is_tmdb_id(query):
             tmdb_id = query[5:]
             url = f"{base}?apikey={self.jackett_api_key}&tmdbid={tmdb_id}"
         else:
@@ -165,14 +212,55 @@ class JackettService:
         indexer_ids: list[str] | None = None,
         timeout: int = 60,
     ) -> list[SearchResult]:
-        url = self.build_search_url(query, category=category, indexer_ids=indexer_ids)
+        force_text = False
+        if indexer_ids and is_id_query(query):
+            id_param = "imdbid" if _is_imdb_id(query) else "tmdbid"
+            if not await self.all_indexers_support_param(indexer_ids, id_param):
+                force_text = True
+
+        url = self.build_search_url(query, category=category, indexer_ids=indexer_ids, force_text=force_text)
         response = await self._client.get(url, timeout=timeout)
+
+        # Torznab returns 500 if any indexer in the list errors (e.g. auth failure).
+        # Fall back to searching each indexer individually so one bad indexer
+        # doesn't suppress results from the others.
+        if response.status_code == 500 and indexer_ids:
+            return await self._search_indexers_individually(
+                query, golden_popcorn=golden_popcorn, category=category,
+                indexer_ids=indexer_ids, force_text=force_text, timeout=timeout,
+            )
+
         response.raise_for_status()
 
         if not response.text.strip():
             return []
 
         return parse_search_results(response.content, golden_popcorn=golden_popcorn)
+
+    async def _search_indexers_individually(
+        self,
+        query: str,
+        golden_popcorn: bool = False,
+        category: str | None = None,
+        indexer_ids: list[str] | None = None,
+        force_text: bool = False,
+        timeout: int = 60,
+    ) -> list[SearchResult]:
+        async def _one(indexer_id: str) -> list[SearchResult]:
+            url = self.build_search_url(query, category=category, indexer_ids=[indexer_id], force_text=force_text)
+            try:
+                response = await self._client.get(url, timeout=timeout)
+                if not response.is_success or not response.text.strip():
+                    return []
+                return parse_search_results(response.content, golden_popcorn=golden_popcorn)
+            except Exception:
+                return []
+
+        results_per_indexer = await asyncio.gather(*[_one(i) for i in (indexer_ids or [])])
+        merged: list[SearchResult] = []
+        for results in results_per_indexer:
+            merged.extend(results)
+        return merged
 
     async def close(self):
         if self._owns_client:
@@ -243,6 +331,11 @@ def parse_search_results(
         if size_bytes is None:
             continue
 
+        seeds = _safe_int(_get_torznab_attr(item, "seeders") or "") or 0
+        leeches = _safe_int(_get_torznab_attr(item, "peers") or "") or 0
+        indexer_el = item.find("jackettindexer")
+        indexer = indexer_el.text if indexer_el is not None and indexer_el.text else ""
+
         results.append(
             SearchResult(
                 title=title,
@@ -251,6 +344,9 @@ def parse_search_results(
                 size_bytes=size_bytes,
                 link=_get_item_text(item, "link"),
                 magnet=_get_torznab_attr(item, "magneturl"),
+                seeds=seeds,
+                leeches=leeches,
+                indexer=indexer,
             )
         )
 
