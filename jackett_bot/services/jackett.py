@@ -110,7 +110,9 @@ class JackettService:
     ) -> bool:
         """Return True only if every indexer in the list supports the given param."""
         for indexer_id in indexer_ids:
-            supported = await self.get_indexer_supported_params(indexer_id, timeout=timeout)
+            supported = await self.get_indexer_supported_params(
+                indexer_id, timeout=timeout
+            )
             if param not in supported:
                 return False
         return True
@@ -123,7 +125,9 @@ class JackettService:
         force_text: bool = False,
     ) -> str:
         indexer_path = ",".join(indexer_ids) if indexer_ids else "all"
-        base = f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
+        base = (
+            f"{self.jackett_url}/api/v2.0/indexers/{indexer_path}/results/torznab/api"
+        )
 
         if not force_text and _is_imdb_id(query):
             url = f"{base}?apikey={self.jackett_api_key}&imdbid={query}"
@@ -218,7 +222,9 @@ class JackettService:
             if not await self.all_indexers_support_param(indexer_ids, id_param):
                 force_text = True
 
-        url = self.build_search_url(query, category=category, indexer_ids=indexer_ids, force_text=force_text)
+        url = self.build_search_url(
+            query, category=category, indexer_ids=indexer_ids, force_text=force_text
+        )
         response = await self._client.get(url, timeout=timeout)
 
         # Torznab returns 500 if any indexer in the list errors (e.g. auth failure).
@@ -226,8 +232,12 @@ class JackettService:
         # doesn't suppress results from the others.
         if response.status_code == 500 and indexer_ids:
             return await self._search_indexers_individually(
-                query, golden_popcorn=golden_popcorn, category=category,
-                indexer_ids=indexer_ids, force_text=force_text, timeout=timeout,
+                query,
+                golden_popcorn=golden_popcorn,
+                category=category,
+                indexer_ids=indexer_ids,
+                force_text=force_text,
+                timeout=timeout,
             )
 
         response.raise_for_status()
@@ -247,16 +257,25 @@ class JackettService:
         timeout: int = 60,
     ) -> list[SearchResult]:
         async def _one(indexer_id: str) -> list[SearchResult]:
-            url = self.build_search_url(query, category=category, indexer_ids=[indexer_id], force_text=force_text)
+            url = self.build_search_url(
+                query,
+                category=category,
+                indexer_ids=[indexer_id],
+                force_text=force_text,
+            )
             try:
                 response = await self._client.get(url, timeout=timeout)
                 if not response.is_success or not response.text.strip():
                     return []
-                return parse_search_results(response.content, golden_popcorn=golden_popcorn)
+                return parse_search_results(
+                    response.content, golden_popcorn=golden_popcorn
+                )
             except Exception:
                 return []
 
-        results_per_indexer = await asyncio.gather(*[_one(i) for i in (indexer_ids or [])])
+        results_per_indexer = await asyncio.gather(
+            *[_one(i) for i in (indexer_ids or [])]
+        )
         merged: list[SearchResult] = []
         for results in results_per_indexer:
             merged.extend(results)
