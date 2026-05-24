@@ -148,7 +148,9 @@ class CommandHandlers:
         disabled = self.settings_service.get_disabled_categories()
         active = [cat for cat in categories if cat.name not in disabled]
         cat_buttons = [
-            InlineKeyboardButton(cat.name, callback_data=f"release_cat:{session_id}:{cat.name}")
+            InlineKeyboardButton(
+                cat.name, callback_data=f"release_cat:{session_id}:{cat.name}"
+            )
             for cat in active
         ]
         keyboard = [cat_buttons[i : i + 3] for i in range(0, len(cat_buttons), 3)]
@@ -176,7 +178,10 @@ class CommandHandlers:
             )
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
             return await self._answer_callback(
                 callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
             )
@@ -238,7 +243,10 @@ class CommandHandlers:
             )
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
             return await self._answer_callback(
                 callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
             )
@@ -260,18 +268,24 @@ class CommandHandlers:
 
         await self._execute_search(reply_message, session)
 
-    async def _execute_search(self, message: Message, search_session: ReleaseSearchSession):
+    async def _execute_search(
+        self, message: Message, search_session: ReleaseSearchSession
+    ):
         sent_message = await self._try_send_searching_message(message)
 
         try:
             category_id = None
             if search_session.category and search_session.category != "All":
                 categories = await self.jackett_service.get_categories()
-                matched = next((c for c in categories if c.name == search_session.category), None)
+                matched = next(
+                    (c for c in categories if c.name == search_session.category), None
+                )
                 if matched:
                     category_id = matched.id
 
-            indexer_ids = search_session.tag_indexer_ids if search_session.tag != "All" else None
+            indexer_ids = (
+                search_session.tag_indexer_ids if search_session.tag != "All" else None
+            )
 
             all_results = await self.jackett_service.search(
                 search_session.query,
@@ -341,9 +355,14 @@ class CommandHandlers:
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        message_chat_id = callback_query.message.chat.id if callback_query.message else 0
+        message_chat_id = (
+            callback_query.message.chat.id if callback_query.message else 0
+        )
 
-        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
             await self._answer_callback(
                 callback_query, "PAGINATION BELONGS TO ANOTHER USER", show_alert=True
             )
@@ -362,7 +381,9 @@ class CommandHandlers:
             return
 
         try:
-            message_text, reply_markup = self._build_page_response(session, requested_page)
+            message_text, reply_markup = self._build_page_response(
+                session, requested_page
+            )
             await callback_query.message.edit_text(
                 message_text,
                 parse_mode=ParseMode.HTML,
@@ -387,7 +408,9 @@ class CommandHandlers:
     async def release_dl(self, callback_query: CallbackQuery):
         parts = callback_query.data.split(":")
         if len(parts) != 3:
-            return await self._answer_callback(callback_query, "INVALID DOWNLOAD REQUEST")
+            return await self._answer_callback(
+                callback_query, "INVALID DOWNLOAD REQUEST"
+            )
 
         _, session_id, index_str = parts
         try:
@@ -402,7 +425,10 @@ class CommandHandlers:
             )
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
             return await self._answer_callback(
                 callback_query, "THIS IS NOT YOUR SEARCH", show_alert=True
             )
@@ -469,9 +495,14 @@ class CommandHandlers:
             return
 
         requester_id = callback_query.from_user.id if callback_query.from_user else 0
-        message_chat_id = callback_query.message.chat.id if callback_query.message else 0
+        message_chat_id = (
+            callback_query.message.chat.id if callback_query.message else 0
+        )
 
-        if requester_id != session.requester_user_id and requester_id != self.config.owner_id:
+        if (
+            requester_id != session.requester_user_id
+            and requester_id != self.config.owner_id
+        ):
             await self._answer_callback(
                 callback_query, "ONLY REQUESTER OR OWNER CAN CLOSE", show_alert=True
             )
@@ -497,7 +528,9 @@ class CommandHandlers:
                 parse_mode=ParseMode.HTML,
                 reply_markup=None,
             )
-            await self._answer_callback(callback_query, "RESULTS CLOSED", show_alert=False)
+            await self._answer_callback(
+                callback_query, "RESULTS CLOSED", show_alert=False
+            )
         except FloodWait as exc:
             self.logger.warning(
                 "FloodWait while closing release message | wait_seconds=%s | session_id=%s",
@@ -720,7 +753,12 @@ class CommandHandlers:
         for cat in categories:
             status = "❌" if cat.name in disabled else "✅"
             keyboard.append(
-                [InlineKeyboardButton(f"{status} {cat.name}", callback_data=f"settings_toggle:{cat.name}")]
+                [
+                    InlineKeyboardButton(
+                        f"{status} {cat.name}",
+                        callback_data=f"settings_toggle:{cat.name}",
+                    )
+                ]
             )
         return InlineKeyboardMarkup(keyboard)
 
@@ -1203,9 +1241,7 @@ class CommandHandlers:
         body_parts = []
         for i, result in enumerate(page_results):
             global_index = start_index + i
-            body_parts.append(
-                f"{global_index + 1}. {result.as_html()}"
-            )
+            body_parts.append(f"{global_index + 1}. {result.as_html()}")
         body = "\n".join(body_parts)
 
         header_suffix = " (GP)" if session.golden_popcorn else ""

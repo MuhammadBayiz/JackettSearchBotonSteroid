@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 from logging.handlers import RotatingFileHandler
@@ -143,6 +144,40 @@ class JackettSearchBot:
         async def inline_query_handler(client, inline_query):
             await self.handlers.inline_query(inline_query)
 
+    async def _send_document_with_retry(
+        self, chat_id: int, document: str, caption: str, max_retries: int = 5
+    ):
+        base_delay = 1
+        for attempt in range(max_retries):
+            try:
+                await self.app.send_document(
+                    chat_id=chat_id,
+                    document=document,
+                    caption=caption,
+                )
+                return True
+            except FloodWait as e:
+                wait_time = e.value + 1
+                self.logger.warning(
+                    "FloodWait while sending document. Sleeping for %s seconds. Attempt %s/%s",
+                    wait_time,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(wait_time)
+            except Exception as e:
+                self.logger.exception(
+                    "Error sending document on attempt %s/%s: %s",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (2**attempt))
+                else:
+                    return False
+        return False
+
     async def _extract_and_send_subtitles(self, chat_id: int, content_path: str):
         if not self.config.subtitle_languages:
             return
@@ -159,13 +194,28 @@ class JackettSearchBot:
                     if f.lower().endswith((".mkv", ".mp4")):
                         video_files.append(os.path.join(root, f))
 
+        def natural_sort_key(s):
+            return [
+                int(text) if text.isdigit() else text.lower()
+                for text in re.split(r"(\d+)", s)
+            ]
+
+        video_files.sort(key=natural_sort_key)
+
         subtitles_extracted = 0
 
         for video_path in video_files:
             try:
                 cmd = [
-                    "ffprobe", "-v", "quiet", "-print_format", "json",
-                    "-show_streams", "-select_streams", "s", video_path,
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    "-select_streams",
+                    "s",
+                    video_path,
                 ]
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -179,15 +229,25 @@ class JackettSearchBot:
                     continue
 
                 streams_data = json.loads(stdout.decode())
-                for stream in streams_data.get("streams", []):
+                streams = streams_data.get("streams", [])
+                # Sort streams by index
+                streams.sort(key=lambda s: s.get("index", 0))
+
+                for stream in streams:
                     tags = stream.get("tags", {})
                     lang = tags.get("language", "und").lower()
                     title = tags.get("title", "")
 
                     if len(lang) == 2:
                         lang_map = {
-                            "en": "eng", "es": "spa", "fr": "fre", "de": "ger",
-                            "it": "ita", "ar": "ara", "ru": "rus", "zh": "chi",
+                            "en": "eng",
+                            "es": "spa",
+                            "fr": "fre",
+                            "de": "ger",
+                            "it": "ita",
+                            "ar": "ara",
+                            "ru": "rus",
+                            "zh": "chi",
                             "ja": "jpn",
                         }
                         lang = lang_map.get(lang, lang)
@@ -204,8 +264,14 @@ class JackettSearchBot:
                         with tempfile.TemporaryDirectory() as tmpdir:
                             out_path = os.path.join(tmpdir, out_filename)
                             ffmpeg_cmd = [
-                                "ffmpeg", "-y", "-v", "quiet", "-i", video_path,
-                                "-map", f"0:{stream_index}",
+                                "ffmpeg",
+                                "-y",
+                                "-v",
+                                "quiet",
+                                "-i",
+                                video_path,
+                                "-map",
+                                f"0:{stream_index}",
                             ]
                             if codec_name == "subrip":
                                 ffmpeg_cmd.extend(["-c:s", "copy"])
@@ -220,17 +286,27 @@ class JackettSearchBot:
                             )
                             await extract_proc.communicate()
 
-                            if extract_proc.returncode == 0 and os.path.exists(out_path):
-                                await self.app.send_document(
+                            if extract_proc.returncode == 0 and os.path.exists(
+                                out_path
+                            ):
+                                success = await self._send_document_with_retry(
                                     chat_id=chat_id,
                                     document=out_path,
                                     caption=caption_text,
                                 )
-                                subtitles_extracted += 1
+                                if success:
+                                    subtitles_extracted += 1
+                                else:
+                                    self.logger.warning(
+                                        "Failed to upload subtitle %s from %s after retries",
+                                        stream_index,
+                                        video_path,
+                                    )
                             else:
                                 self.logger.warning(
                                     "Failed to extract subtitle %s from %s",
-                                    stream_index, video_path,
+                                    stream_index,
+                                    video_path,
                                 )
             except Exception as exc:
                 self.logger.exception(
@@ -253,6 +329,7 @@ class JackettSearchBot:
                         raw_text,
                     )
                     import ast
+
                     try:
                         payload = ast.literal_eval(raw_text)
                     except Exception:
@@ -277,10 +354,14 @@ class JackettSearchBot:
             if chat_id is not None:
                 text_msg = f"<b>{torrent_name}</b> torrent downloaded."
 
-                if content_path and self.config.index_base_url and self.config.media_local_path:
+                if (
+                    content_path
+                    and self.config.index_base_url
+                    and self.config.media_local_path
+                ):
                     rel_path = content_path
                     if content_path.startswith(self.config.media_local_path):
-                        rel_path = content_path[len(self.config.media_local_path):]
+                        rel_path = content_path[len(self.config.media_local_path) :]
                     rel_path = rel_path.lstrip("/")
                     url_parts = [quote(p) for p in rel_path.split("/")]
                     index_url = f"{self.config.index_base_url.rstrip('/')}/{'/'.join(url_parts)}"
@@ -375,8 +456,11 @@ class JackettSearchBot:
 
         if RichHandler is not None:
             console_handler = RichHandler(
-                show_time=True, show_level=True, show_path=False,
-                markup=False, rich_tracebacks=True,
+                show_time=True,
+                show_level=True,
+                show_path=False,
+                markup=False,
+                rich_tracebacks=True,
             )
             console_format = "%(message)s"
         else:
@@ -387,8 +471,10 @@ class JackettSearchBot:
         console_handler.setFormatter(logging.Formatter(console_format))
 
         file_handler = RotatingFileHandler(
-            filename=log_path, maxBytes=10 * 1024 * 1024,
-            backupCount=5, encoding="utf-8",
+            filename=log_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
         )
         file_handler.setLevel(self.config.file_log_level)
         file_handler.setFormatter(
